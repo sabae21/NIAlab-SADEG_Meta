@@ -4,8 +4,6 @@
 #              followed by BRETIGEA marker-based confirmation and hybrid cell
 #              removal — astrocyte subsetting, and Harmony batch correction.
 #              Datasets: GSE157827, GSE167494, GSE214979, GSE268599, GSE303823.
-# Reference:   Bakken et al., Nature 2021 (Azimuth Human Motor Cortex)
-# Version:     1.0
 ################################################################################
 
 # ==============================================================================
