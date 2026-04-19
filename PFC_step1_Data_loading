@@ -1,0 +1,789 @@
+# ==============================================================================
+# Step 1: Raw Data Loading and Azimuth Input Preparation
+# 
+# Description:
+#   Loads snRNA-seq raw count data from six GEO datasets (GSE157827, GSE167494,
+#   GSE214979, GSE263468, GSE268599, GSE303823), builds per-dataset sample
+#   lookup tables by joining GEO series matrix metadata with author-provided
+#   Braak stage information, applies inclusion criteria (AD: Braak V-VI;
+#   Control: Braak 0-II), performs basic QC filtering, and saves merged Seurat
+#   objects as .rds files for downstream Azimuth annotation.
+#
+# Inclusion criteria:
+#   AD      : Braak stage V or VI
+#   Control : Braak stage 0, I, or II
+#   Excluded: Braak III-IV; non-AD diagnoses (DLB, PDD)
+#
+# QC thresholds (applied uniformly across all datasets):
+#   nFeature_RNA : 200 – 5,000
+#   percent.mt   : < 10%
+#
+# Output (saved to output_dir):
+#   gse*_lookup_table.csv        – per-dataset sample metadata
+#   gse*_azimuth_input.rds       – merged, QC-filtered Seurat objects
+# ==============================================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(stringr)
+  library(openxlsx)
+  library(GEOquery)
+  library(Seurat)
+  library(SeuratDisk)
+})
+
+output_dir <- "~/meta_analysis/results/PFC"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+
+# ==============================================================================
+# 1. GSE157827 (Lau et al., Nature Neuroscience 2020)
+# ==============================================================================
+
+data_dir <- "~/meta_analysis/raw_data/PFC/GSE157827"
+
+series_matrix_path <- file.path(data_dir, "GSE157827_series_matrix.txt")
+if (!file.exists(series_matrix_path)) {
+  series_matrix_path <- file.path(data_dir, "GSE157827_series_matrix-2.txt")
+}
+braak_info_path <- file.path(data_dir, "GSE157827_braak_info.csv")
+
+# ------------------------------------------------------------------------------
+# 1.1  Parse GEO series matrix
+# ------------------------------------------------------------------------------
+
+parse_gse157827_series_matrix <- function(path) {
+  lines        <- readLines(path, warn = FALSE)
+  sample_lines <- lines[grepl("^!Sample_", lines)]
+
+  get_sample_line <- function(prefix) {
+    x <- sample_lines[grepl(paste0("^", prefix), sample_lines)]
+    if (length(x) == 0) return(NULL)
+    x[1]
+  }
+
+  split_geo_line <- function(x) {
+    vals <- strsplit(x, "\t")[[1]][-1]
+    gsub('^"|"$', "", vals)
+  }
+
+  char_lines <- sample_lines[grepl("^!Sample_characteristics_ch1", sample_lines)]
+  char_map   <- list()
+  for (ln in char_lines) {
+    vals <- gsub('^"|"$', "", strsplit(ln, "\t")[[1]][-1])
+    key  <- str_trim(strsplit(vals[1], ":")[[1]][1])
+    char_map[[key]] <- str_replace(vals, paste0("^", fixed(key), ":\\s*"), "")
+  }
+
+  tibble(
+    sample_name      = split_geo_line(get_sample_line("!Sample_title")),
+    gsm_id           = split_geo_line(get_sample_line("!Sample_geo_accession")),
+    sample_status    = split_geo_line(get_sample_line("!Sample_status")),
+    last_update_date = split_geo_line(get_sample_line("!Sample_last_update_date")),
+    source_name      = split_geo_line(get_sample_line("!Sample_source_name_ch1")),
+    organism         = split_geo_line(get_sample_line("!Sample_organism_ch1")),
+    tissue           = char_map[["tissue"]],
+    diagnosis_series = char_map[["diagnosis"]],
+    instrument_model = split_geo_line(get_sample_line("!Sample_instrument_model")),
+    library_strategy = split_geo_line(get_sample_line("!Sample_library_strategy"))
+  )
+}
+
+lookup_series <- parse_gse157827_series_matrix(series_matrix_path)
+
+# ------------------------------------------------------------------------------
+# 1.2  Join with author-provided Braak stage information
+# ------------------------------------------------------------------------------
+
+braak_info <- read_csv(braak_info_path, show_col_types = FALSE) %>%
+  rename(
+    sample_name          = ID,
+    condition_csv        = CONDITION,
+    age                  = AGE,
+    sex                  = SEX,
+    pmd_hr               = PMD,
+    hist_diagnosis       = `HIST DIAGNOSIS`,
+    diag_1               = `DIAG 1`,
+    diag_2               = `DIAG 2`,
+    diag_3               = `DIAG 3`,
+    amyloid_plaque_score = `AGE-RELATED PLAQUE SCORE`,
+    braak_numeric        = `Braak tangle stage`,
+    apoe                 = APOE
+  )
+
+lookup_table <- lookup_series %>%
+  left_join(braak_info, by = "sample_name") %>%
+  mutate(
+    condition = case_when(
+      condition_csv == "AD" ~ "AD",
+      condition_csv == "NC" ~ "Control",
+      TRUE                  ~ NA_character_
+    ),
+    region = "PFC",
+    included_in_analysis = case_when(
+      sample_name %in% c("AD5", "AD10", "AD19")          ~ "NO",
+      braak_numeric %in% c(5, 6) & condition == "AD"      ~ "YES",
+      braak_numeric %in% c(0, 1, 2) & condition == "Control" ~ "YES",
+      TRUE                                                ~ "NO"
+    ),
+    exclusion_reason = case_when(
+      sample_name %in% c("AD5", "AD10", "AD19") ~ "Braak IV excluded",
+      included_in_analysis == "YES"              ~ NA_character_,
+      TRUE                                       ~ "Outside Braak criteria (AD V-VI / Control 0-II)"
+    )
+  ) %>%
+  arrange(factor(condition, levels = c("AD", "Control")), desc(braak_numeric), sample_name)
+
+write_csv(lookup_table, file.path(output_dir, "gse157827_lookup_table.csv"))
+write.xlsx(lookup_table, file.path(output_dir, "gse157827_lookup_table.xlsx"), asTable = TRUE)
+
+# ------------------------------------------------------------------------------
+# 1.3  Select samples meeting inclusion criteria
+# ------------------------------------------------------------------------------
+
+meta_ref <- lookup_table %>%
+  filter(included_in_analysis == "YES") %>%
+  select(gsm_id, sample_name, condition, braak_numeric, region,
+         age, sex, pmd_hr, apoe, hist_diagnosis, amyloid_plaque_score)
+
+# ------------------------------------------------------------------------------
+# 1.4  Load per-sample count matrices
+# ------------------------------------------------------------------------------
+
+seurat_list <- list()
+
+for (i in seq_len(nrow(meta_ref))) {
+  gsm_id <- meta_ref$gsm_id[i]
+  sid    <- meta_ref$sample_name[i]
+  prefix <- paste0(gsm_id, "_", sid)
+
+  mtx_path  <- list.files(data_dir, pattern = paste0("^", prefix, ".*matrix.mtx.gz$"),   full.names = TRUE)[1]
+  bar_path  <- list.files(data_dir, pattern = paste0("^", prefix, ".*barcodes.tsv.gz$"), full.names = TRUE)[1]
+  feat_path <- list.files(data_dir, pattern = paste0("^", prefix, ".*features.tsv.gz$"), full.names = TRUE)[1]
+
+  if (is.na(mtx_path) || is.na(bar_path) || is.na(feat_path)) {
+    mtx_path  <- list.files(data_dir, pattern = paste0("^", gsm_id, ".*matrix.mtx.gz$"),   full.names = TRUE)[1]
+    bar_path  <- list.files(data_dir, pattern = paste0("^", gsm_id, ".*barcodes.tsv.gz$"), full.names = TRUE)[1]
+    feat_path <- list.files(data_dir, pattern = paste0("^", gsm_id, ".*features.tsv.gz$"), full.names = TRUE)[1]
+  }
+
+  stopifnot(file.exists(mtx_path), file.exists(bar_path), file.exists(feat_path))
+
+  counts     <- ReadMtx(mtx = mtx_path, cells = bar_path, features = feat_path)
+  seurat_obj <- CreateSeuratObject(counts = counts, project = gsm_id,
+                                   min.cells = 10, min.features = 200)
+
+  seurat_obj$study                <- "GSE157827"
+  seurat_obj$sample_id            <- sid
+  seurat_obj$gsm_id               <- gsm_id
+  seurat_obj$condition            <- meta_ref$condition[i]
+  seurat_obj$braak_numeric        <- meta_ref$braak_numeric[i]
+  seurat_obj$region               <- meta_ref$region[i]
+  seurat_obj$age                  <- meta_ref$age[i]
+  seurat_obj$sex                  <- meta_ref$sex[i]
+  seurat_obj$pmd_hr               <- meta_ref$pmd_hr[i]
+  seurat_obj$apoe                 <- meta_ref$apoe[i]
+  seurat_obj$hist_diagnosis       <- meta_ref$hist_diagnosis[i]
+  seurat_obj$amyloid_plaque_score <- meta_ref$amyloid_plaque_score[i]
+
+  seurat_list[[gsm_id]] <- seurat_obj
+}
+
+# ------------------------------------------------------------------------------
+# 1.5  Merge and QC filtering
+# ------------------------------------------------------------------------------
+
+merged_obj <- merge(seurat_list[[1]], y = seurat_list[-1],
+                    add.cell.ids = names(seurat_list), project = "GSE157827")
+merged_obj <- JoinLayers(merged_obj)
+
+merged_obj[["percent.mt"]] <- PercentageFeatureSet(merged_obj, pattern = "^MT-")
+merged_obj <- subset(merged_obj,
+                     subset = nFeature_RNA > 200 & nFeature_RNA < 5000 & percent.mt < 10)
+
+saveRDS(merged_obj, file.path(output_dir, "gse157827_azimuth_input.rds"))
+rm(seurat_list, merged_obj); gc()
+
+
+
+# ==============================================================================
+# 2. GSE167494 (Sadick et al., Nature Neuroscience 2022)
+# ==============================================================================
+
+data_dir_167 <- "~/meta_analysis/raw_data/PFC/GSE167494"
+matrix_file  <- file.path(data_dir_167, "GSE167494_series_matrix.txt")
+braak_file   <- file.path(data_dir_167, "GSE167494_braak_info.csv")
+
+# ------------------------------------------------------------------------------
+# 2.1  Build lookup table
+# ------------------------------------------------------------------------------
+
+gse <- getGEO(filename = matrix_file, GSEMatrix = TRUE, getGPL = FALSE)
+
+lookup_geo <- pData(gse) %>%
+  select(-matches("extract_protocol|data_processing|supplementary|relation|description")) %>%
+  rename(sample_id = geo_accession, geo_title = title, tissue = source_name_ch1)
+
+# Retain snRNA-seq samples only (exclude SOX9-sorted nuclei; keep "Donor*" titles)
+lookup_snseq <- lookup_geo %>%
+  filter(grepl("^Donor", geo_title)) %>%
+  mutate(donor_key = gsub("^Donor", "D", geo_title))
+
+braak_csv <- read.csv(braak_file, stringsAsFactors = FALSE) %>%
+  filter(!grepl("\\(IF\\)", DONOR_NUMBER)) %>%   # Exclude immunofluorescence donors
+  select(donor_key = DONOR_NUMBER, braak_numeric = BRAAK,
+         pmi = PMI, apoe = APOE, rin = RIN, sample_bank_id = SAMPLE_ID) %>%
+  mutate(braak_numeric = suppressWarnings(as.numeric(braak_numeric)))
+
+lookup_table <- lookup_snseq %>%
+  left_join(braak_csv, by = "donor_key") %>%
+  mutate(
+    condition = case_when(
+      braak_numeric >= 5 ~ "AD",
+      braak_numeric <= 2 ~ "Control",
+      TRUE               ~ NA_character_
+    ),
+    region = "PFC",
+    study  = "GSE167494"
+  ) %>%
+  select(sample_id, geo_title, donor_key, sample_bank_id, tissue,
+         disease_state = `disease state:ch1`, sex = `Sex:ch1`, age = `age:ch1`,
+         sorting = `sorting_condition:ch1`,
+         braak_numeric, condition, pmi, apoe, rin, region, study)
+
+write.csv(lookup_table, file.path(output_dir, "gse167494_lookup_table.csv"), row.names = FALSE)
+
+# ------------------------------------------------------------------------------
+# 2.2  Select samples and load count matrices
+# ------------------------------------------------------------------------------
+
+meta_ref   <- lookup_table %>%
+  filter(!is.na(braak_numeric), !is.na(condition)) %>%
+  select(sample_id, braak_numeric, condition, region)
+
+seurat_list <- list()
+
+for (gsm_id in meta_ref$sample_id) {
+  mtx_file  <- list.files(data_dir_167, pattern = paste0(gsm_id, ".*matrix.mtx.gz"),   full.names = TRUE)[1]
+  bar_file  <- list.files(data_dir_167, pattern = paste0(gsm_id, ".*barcodes.tsv.gz"), full.names = TRUE)[1]
+  feat_file <- list.files(data_dir_167, pattern = paste0(gsm_id, ".*features.tsv.gz"), full.names = TRUE)[1]
+
+  if (any(is.na(c(mtx_file, bar_file, feat_file)))) {
+    warning(paste("[GSE167494] Files missing for:", gsm_id))
+    next
+  }
+
+  counts     <- ReadMtx(mtx = mtx_file, cells = bar_file, features = feat_file)
+  seurat_obj <- CreateSeuratObject(counts = counts, project = gsm_id,
+                                   min.cells = 10, min.features = 200)
+
+  curr_meta                <- meta_ref[meta_ref$sample_id == gsm_id, ]
+  seurat_obj$study         <- "GSE167494"
+  seurat_obj$sample_id     <- gsm_id
+  seurat_obj$condition     <- curr_meta$condition
+  seurat_obj$braak_numeric <- curr_meta$braak_numeric
+  seurat_obj$region        <- curr_meta$region
+
+  seurat_list[[gsm_id]] <- seurat_obj
+}
+
+# ------------------------------------------------------------------------------
+# 2.3  Merge and QC filtering
+# ------------------------------------------------------------------------------
+
+if (length(seurat_list) == 0) stop("[GSE167494] No samples loaded.")
+
+merged_obj <- if (length(seurat_list) > 1) {
+  merge(seurat_list[[1]], y = seurat_list[-1],
+        add.cell.ids = names(seurat_list), project = "GSE167494")
+} else {
+  seurat_list[[1]]
+}
+
+merged_obj <- JoinLayers(merged_obj)
+merged_obj[["percent.mt"]] <- PercentageFeatureSet(merged_obj, pattern = "^MT-")
+merged_obj <- subset(merged_obj,
+                     subset = nFeature_RNA > 200 & nFeature_RNA < 5000 & percent.mt < 10)
+
+saveRDS(merged_obj, file.path(output_dir, "gse167494_azimuth_input.rds"))
+rm(gse, lookup_geo, lookup_snseq, braak_csv, lookup_table, meta_ref, seurat_list, merged_obj); gc()
+
+
+
+
+# ==============================================================================
+# 3. GSE214979 (Anderson et al., Nature Neuroscience 2023)
+# ==============================================================================
+
+data_dir_214 <- "~/meta_analysis/raw_data/PFC/GSE214979"
+matrix_file  <- file.path(data_dir_214, "GSE214979_series_matrix.txt")
+braak_file   <- file.path(data_dir_214, "GSE214979_braak_info.csv")
+
+# ------------------------------------------------------------------------------
+# 3.1  Build lookup table
+# ------------------------------------------------------------------------------
+
+gse <- getGEO(filename = matrix_file, GSEMatrix = TRUE, getGPL = FALSE)
+
+lookup_geo <- pData(gse) %>%
+  select(-matches("extract_protocol|data_processing|supplementary|relation|description")) %>%
+  rename(sample_id = geo_accession, geo_title = title, tissue = source_name_ch1)
+
+# Retain scRNA-seq samples only (exclude scATAC-seq; molecule_ch1 == "polyA RNA")
+lookup_rna <- lookup_geo %>%
+  filter(molecule_ch1 == "polyA RNA") %>%
+  mutate(
+    donor_id = gsub(",.*$", "", geo_title) %>% trimws() %>% gsub(" rep[0-9]+$", "", .)
+  )
+
+# CSV header offset: row 1 is a title row; data starts at row 2
+braak_csv <- read.csv(braak_file, skip = 1, stringsAsFactors = FALSE) %>%
+  rename(donor_id = ID, age = Age, ethnicity = Ethnicity, sex = Gender,
+         apoe = APOE_Status, diagnosis_raw = Diagnosis, braak_numeric = Braak,
+         pmi = PMI.h., rin = RIN, structure = structure) %>%
+  select(donor_id, age, ethnicity, sex, apoe, diagnosis_raw, braak_numeric, pmi, rin, structure) %>%
+  mutate(
+    donor_id      = as.character(donor_id),
+    braak_numeric = suppressWarnings(as.numeric(braak_numeric))
+  )
+
+lookup_table <- lookup_rna %>%
+  left_join(braak_csv, by = "donor_id") %>%
+  mutate(
+    # Unaffected controls lack a recorded Braak stage; imputed to 0
+    braak_numeric = case_when(
+      diagnosis_raw == "Unaffected" & is.na(braak_numeric) ~ 0,
+      TRUE ~ braak_numeric
+    ),
+    condition = case_when(
+      braak_numeric >= 5 ~ "AD",
+      braak_numeric <= 2 ~ "Control",
+      TRUE               ~ NA_character_
+    ),
+    region = "PFC",
+    study  = "GSE214979"
+  ) %>%
+  select(sample_id, geo_title, donor_id, tissue, diagnosis_raw, sex, age, ethnicity,
+         braak_numeric, condition, pmi, apoe, rin, structure, region, study)
+
+write.csv(lookup_table, file.path(output_dir, "gse214979_lookup_table.csv"), row.names = FALSE)
+
+# ------------------------------------------------------------------------------
+# 3.2  Select samples and load data
+# ------------------------------------------------------------------------------
+
+meta_ref <- lookup_table %>%
+  filter(tissue %in% c("DLPFC", "BA9", "BA46"), !is.na(condition)) %>%
+  select(sample_id, donor_id, braak_numeric, condition, region)
+
+donor_meta_lut              <- distinct(select(meta_ref, donor_id, condition, braak_numeric, region))
+rownames(donor_meta_lut)    <- donor_meta_lut$donor_id
+
+h5_file   <- file.path(data_dir_214, "GSE214979_filtered_feature_bc_matrix.h5")
+meta_file <- file.path(data_dir_214, "GSE214979_cell_metadata.csv.gz")
+
+counts <- Read10X_h5(h5_file)
+if (is.list(counts)) counts <- counts[["Gene Expression"]]
+
+cell_meta    <- read.csv(meta_file, row.names = 1)
+common_cells <- intersect(colnames(counts), rownames(cell_meta))
+
+# ------------------------------------------------------------------------------
+# 3.3  Create Seurat object and inject metadata
+# ------------------------------------------------------------------------------
+
+seurat_obj <- CreateSeuratObject(counts = counts[, common_cells],
+                                 meta.data = cell_meta[common_cells, ],
+                                 project = "GSE214979",
+                                 min.cells = 10, min.features = 200)
+
+if (!"donor_id" %in% colnames(seurat_obj@meta.data)) seurat_obj$donor_id <- seurat_obj$id
+
+seurat_obj <- subset(seurat_obj, subset = donor_id %in% donor_meta_lut$donor_id)
+
+seurat_obj$study         <- "GSE214979"
+seurat_obj$sample_id     <- seurat_obj$donor_id
+seurat_obj$condition     <- donor_meta_lut[seurat_obj$donor_id, "condition"]
+seurat_obj$braak_numeric <- donor_meta_lut[seurat_obj$donor_id, "braak_numeric"]
+seurat_obj$region        <- "PFC"
+
+# ------------------------------------------------------------------------------
+# 3.4  QC filtering
+# ------------------------------------------------------------------------------
+
+seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = "^MT-")
+seurat_obj <- subset(seurat_obj,
+                     subset = nFeature_RNA > 200 & nFeature_RNA < 5000 & percent.mt < 10)
+
+saveRDS(seurat_obj, file.path(output_dir, "gse214979_azimuth_input.rds"))
+rm(gse, lookup_geo, lookup_rna, braak_csv, lookup_table, meta_ref,
+   donor_meta_lut, counts, cell_meta, seurat_obj); gc()
+
+
+
+
+# ==============================================================================
+# 4. GSE263468 (Cobos et al., Nature Communications 2024)
+# ==============================================================================
+
+data_dir_263 <- "~/meta_analysis/raw_data/PFC/GSE263468"
+matrix_file  <- file.path(data_dir_263, "GSE263468-GPL18573_series_matrix.txt")
+
+# ------------------------------------------------------------------------------
+# 4.1  Build lookup table
+# ------------------------------------------------------------------------------
+
+gse <- getGEO(filename = matrix_file, GSEMatrix = TRUE, getGPL = FALSE)
+pd  <- pData(gse)
+
+parse_char_col <- function(pd, key_pattern) {
+  char_cols <- grep("^characteristics_ch1", colnames(pd), value = TRUE)
+  for (col in char_cols) {
+    first_val <- pd[[col]][!is.na(pd[[col]]) & pd[[col]] != ""][1]
+    if (!is.na(first_val) && grepl(key_pattern, first_val, ignore.case = TRUE))
+      return(trimws(sub("^[^:]+:\\s*", "", as.character(pd[[col]]))))
+  }
+  rep(NA_character_, nrow(pd))
+}
+
+lookup_table <- data.frame(GSM_accession = pd$geo_accession,
+                           geo_title = pd$title,
+                           stringsAsFactors = FALSE) %>%
+  mutate(
+    run_id       = str_extract(geo_title, "(?<=ID:)D\\d+"),
+    subject      = parse_char_col(pd, "^subject"),
+    brain_region = parse_char_col(pd, "^brain\\.region"),
+    sort         = parse_char_col(pd, "^sort"),
+    np_diagnosis = parse_char_col(pd, "^np\\.diagonis"),
+    braak_stage  = parse_char_col(pd, "^braak\\.stage"),
+    disease_group = parse_char_col(pd, "^disease\\.group"),
+    amyloid      = parse_char_col(pd, "^amyloid"),
+    apoe_class   = parse_char_col(pd, "^apoe class"),
+    pmi_hr       = parse_char_col(pd, "^pmi \\(hr\\)"),
+    sex          = parse_char_col(pd, "^sex"),
+    age          = parse_char_col(pd, "^age")
+  ) %>%
+  mutate(
+    braak_numeric = case_when(
+      braak_stage == "0"   ~ 0, braak_stage == "I"   ~ 1,
+      braak_stage == "II"  ~ 2, braak_stage == "III" ~ 3,
+      braak_stage == "IV"  ~ 4, braak_stage == "V"   ~ 5,
+      braak_stage == "VI"  ~ 6, TRUE ~ NA_real_
+    ),
+    condition = case_when(
+      np_diagnosis == "AD"      & braak_numeric >= 5 ~ "AD",
+      np_diagnosis == "Control" & braak_numeric <= 2 ~ "Control",
+      TRUE ~ NA_character_
+    ),
+    region = "PFC",
+    study  = "GSE263468"
+  )
+
+write.csv(lookup_table, file.path(output_dir, "gse263468_lookup_table.csv"), row.names = FALSE)
+
+# ------------------------------------------------------------------------------
+# 4.2  Select samples and load h5ad via SeuratDisk
+# ------------------------------------------------------------------------------
+
+meta_ref <- lookup_table %>%
+  filter(brain_region == "Frontal Cx (BA9)", sort == "All Nuclei", !is.na(condition)) %>%
+  select(run_id, GSM_accession, subject, braak_numeric, condition, region)
+
+donor_meta_lut           <- distinct(select(meta_ref, run_id, condition, braak_numeric, region))
+rownames(donor_meta_lut) <- donor_meta_lut$run_id
+
+h5ad_path     <- file.path(data_dir_263, "GSE263468_processed_data.h5ad")
+h5seurat_path <- file.path(data_dir_263, "GSE263468_processed_data.h5seurat")
+
+if (!file.exists(h5seurat_path)) Convert(h5ad_path, dest = "h5seurat", overwrite = FALSE)
+
+seurat_full <- LoadH5Seurat(h5seurat_path, meta.data = TRUE, misc = FALSE)
+
+# ------------------------------------------------------------------------------
+# 4.3  Subset astrocytes
+# ------------------------------------------------------------------------------
+
+celltype_col <- intersect(
+  c("cell_type", "celltype", "cell.type", "cluster_label", "annotation", "cell_class"),
+  colnames(seurat_full@meta.data)
+)[1]
+
+if (is.na(celltype_col))
+  stop("[GSE263468] Cell type column not found. Inspect colnames(seurat_full@meta.data).")
+
+astro_cells  <- colnames(seurat_full)[
+  grepl("astro", seurat_full@meta.data[[celltype_col]], ignore.case = TRUE)]
+seurat_astro <- subset(seurat_full, cells = astro_cells)
+rm(seurat_full); gc()
+
+# ------------------------------------------------------------------------------
+# 4.4  Filter to selected samples and inject metadata
+# ------------------------------------------------------------------------------
+
+sample_id_col <- intersect(
+  c("orig.ident", "sample", "sample_id", "run_id", "donor", "donor_id", "library_id"),
+  colnames(seurat_astro@meta.data)
+)[1]
+
+if (is.na(sample_id_col))
+  stop("[GSE263468] Sample ID column not found. Inspect colnames(seurat_astro@meta.data).")
+
+seurat_obj <- subset(seurat_astro,
+                     cells = colnames(seurat_astro)[
+                       seurat_astro@meta.data[[sample_id_col]] %in% rownames(donor_meta_lut)])
+rm(seurat_astro); gc()
+
+cell_run_ids             <- seurat_obj@meta.data[[sample_id_col]]
+seurat_obj$study         <- "GSE263468"
+seurat_obj$sample_id     <- cell_run_ids
+seurat_obj$condition     <- donor_meta_lut[cell_run_ids, "condition"]
+seurat_obj$braak_numeric <- donor_meta_lut[cell_run_ids, "braak_numeric"]
+seurat_obj$region        <- "PFC"
+
+# ------------------------------------------------------------------------------
+# 4.5  QC filtering
+# ------------------------------------------------------------------------------
+
+seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = "^MT-")
+seurat_obj <- subset(seurat_obj,
+                     subset = nFeature_RNA > 200 & nFeature_RNA < 5000 & percent.mt < 10)
+
+saveRDS(seurat_obj, file.path(output_dir, "gse263468_azimuth_input.rds"))
+rm(gse, pd, lookup_table, meta_ref, donor_meta_lut, astro_cells, cell_run_ids, seurat_obj); gc()
+
+
+
+
+# ==============================================================================
+# 5. GSE268599 (Serrano-Pozo et al., Acta Neuropathologica 2024)
+# ==============================================================================
+
+data_dir_268 <- "~/meta_analysis/raw_data/PFC/GSE268599"
+matrix_file  <- file.path(data_dir_268, "GSE268599_series_matrix.txt")
+braak_file   <- file.path(data_dir_268, "GSE268599_braak_info.csv")
+sample_file  <- file.path(data_dir_268, "DonorID_SampleName.csv")
+
+# ------------------------------------------------------------------------------
+# 5.1  Build lookup table
+# ------------------------------------------------------------------------------
+
+# supplementary_file_1 encodes the MW library ID (e.g., "6289-MW-0199"),
+# which serves as the join key to DonorID_SampleName.csv.
+gse <- getGEO(filename = matrix_file, GSEMatrix = TRUE, getGPL = FALSE)
+pd  <- pData(gse)
+
+lookup_geo <- pd %>%
+  select(sample_id = geo_accession, geo_title = title,
+         supplementary_file = supplementary_file_1,
+         tissue = `tissue:ch1`, age = `age:ch1`, sex = `Sex:ch1`) %>%
+  mutate(
+    SampleName = str_extract(supplementary_file, "6289-MW-[0-9]+"),
+    sex = case_when(tolower(sex) == "male" ~ "M", tolower(sex) == "female" ~ "F", TRUE ~ sex)
+  )
+
+if (any(is.na(lookup_geo$SampleName)))
+  stop("MW library ID extraction failed. Verify supplementary_file_1 format.")
+
+sample_csv <- read.csv(sample_file, stringsAsFactors = FALSE) %>%
+  transmute(sample_name = sample_name, SampleName = SampleName,
+            tissue_csv = region, number_nuclei_sorted = number_nuclei_sorted,
+            RIN = as.character(RIN), donor_id = as.integer(Donor.ID))
+
+braak_csv <- read.csv(braak_file, stringsAsFactors = FALSE) %>%
+  rename(donor_id = Donor.ID, braak_stage = Braak, cerad = CERAD,
+         path_stage = Pathology.Stage, apoe = APOE, sex_braak = Sex, age_braak = Age) %>%
+  select(donor_id, braak_stage, cerad, path_stage, apoe, sex_braak, age_braak) %>%
+  mutate(
+    donor_id = as.integer(donor_id),
+    braak_numeric = case_when(
+      braak_stage == "0"   ~ 0L, braak_stage == "I"   ~ 1L,
+      braak_stage == "II"  ~ 2L, braak_stage == "III" ~ 3L,
+      braak_stage == "IV"  ~ 4L, braak_stage == "V"   ~ 5L,
+      braak_stage == "VI"  ~ 6L, TRUE ~ NA_integer_
+    )
+  )
+
+lookup_table <- lookup_geo %>%
+  left_join(sample_csv, by = "SampleName") %>%
+  left_join(braak_csv,  by = "donor_id") %>%
+  mutate(
+    condition = case_when(
+      braak_numeric >= 5L ~ "AD",
+      braak_numeric <= 2L ~ "Control",
+      TRUE                ~ NA_character_
+    ),
+    region = "PFC",
+    study  = "GSE268599"
+  ) %>%
+  select(sample_id, geo_title, sample_name, SampleName, tissue, donor_id,
+         braak_stage, braak_numeric, condition, cerad, path_stage, apoe,
+         sex, age, RIN, number_nuclei_sorted, region, study)
+
+write.csv(lookup_table, file.path(output_dir, "gse268599_lookup_table.csv"), row.names = FALSE)
+
+if (any(is.na(lookup_table$sample_name)))
+  warning(sprintf("[GSE268599] %d rows failed to join on SampleName.",
+                  sum(is.na(lookup_table$sample_name))))
+
+# ------------------------------------------------------------------------------
+# 5.2  Select BA46 samples and load count matrices
+# ------------------------------------------------------------------------------
+
+meta_ref <- lookup_table %>%
+  filter(tissue == "BA46", !is.na(condition)) %>%
+  select(sample_id, donor_id, sample_name, SampleName, braak_numeric, condition)
+
+donor_meta_lut           <- distinct(select(meta_ref, sample_name, condition, braak_numeric))
+rownames(donor_meta_lut) <- donor_meta_lut$sample_name
+
+seurat_list <- list()
+
+for (i in seq_len(nrow(meta_ref))) {
+  sn     <- meta_ref$sample_name[i]
+  gsm_id <- meta_ref$sample_id[i]
+  mw_val <- meta_ref$SampleName[i]
+  prefix <- file.path(data_dir_268, paste0(gsm_id, "_", mw_val))
+
+  mtx_file      <- paste0(prefix, "_matrix.mtx.gz")
+  barcodes_file <- paste0(prefix, "_barcodes.tsv.gz")
+  features_file <- paste0(prefix, "_features.tsv.gz")
+
+  if (!file.exists(mtx_file)) {
+    warning(sprintf("[GSE268599] File not found: %s", basename(mtx_file)))
+    next
+  }
+
+  counts_i <- ReadMtx(mtx = mtx_file, cells = barcodes_file, features = features_file)
+  so       <- CreateSeuratObject(counts = counts_i, project = sn,
+                                 min.cells = 10, min.features = 200)
+
+  so$sample_name   <- sn
+  so$SampleName    <- mw_val
+  so$donor_id      <- meta_ref$donor_id[i]
+  so$condition     <- meta_ref$condition[i]
+  so$braak_numeric <- meta_ref$braak_numeric[i]
+  so$tissue        <- "BA46"
+  so$region        <- "PFC"
+  so$study         <- "GSE268599"
+
+  seurat_list[[sn]] <- so
+}
+
+# ------------------------------------------------------------------------------
+# 5.3  Merge and QC filtering
+# ------------------------------------------------------------------------------
+
+seurat_obj <- merge(seurat_list[[1]], y = seurat_list[-1],
+                    add.cell.ids = names(seurat_list), project = "GSE268599")
+
+seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = "^MT-")
+seurat_obj <- subset(seurat_obj,
+                     subset = nFeature_RNA > 200 & nFeature_RNA < 5000 & percent.mt < 10)
+
+saveRDS(seurat_obj, file.path(output_dir, "gse268599_azimuth_input.rds"))
+rm(gse, pd, lookup_geo, sample_csv, braak_csv, lookup_table,
+   meta_ref, donor_meta_lut, seurat_list, seurat_obj); gc()
+
+
+
+
+# ==============================================================================
+# 6. GSE303823 (Chia et al., Genome Medicine 2025)
+# ==============================================================================
+
+data_dir_303 <- "~/meta_analysis/raw_data/PFC/GSE303823"
+rds_file     <- file.path(data_dir_303, "GSE303823_raw_counts.rds")
+braak_file   <- file.path(data_dir_303, "GSE303823_braak_info.csv")
+
+# ------------------------------------------------------------------------------
+# 6.1  Build lookup table
+# ------------------------------------------------------------------------------
+
+# Braak stage information is derived from Table S3 (author-provided CSV).
+# The CSV has an irregular header (empty row 1, title row 2, column names row 3).
+# Paper labels NCI_1–4 correspond to in-data labels CTRL_4–7, verified by
+# cross-matching cell counts (discrepancy ≤7%).
+braak_raw           <- read.csv(braak_file, header = FALSE, stringsAsFactors = FALSE)
+colnames(braak_raw) <- braak_raw[3, ]
+braak_raw           <- braak_raw[4:nrow(braak_raw), 2:ncol(braak_raw)]
+
+lookup_table_full <- braak_raw %>%
+  rename(paper_id = Samples, diagnosis_raw = Diagnosis, braak_stage = `AD grade`) %>%
+  filter(paper_id != "") %>%
+  mutate(
+    braak_numeric = case_when(
+      grepl("stage I$",   braak_stage) ~ 1, grepl("stage II$",  braak_stage) ~ 2,
+      grepl("stage III$", braak_stage) ~ 3, grepl("stage IV$",  braak_stage) ~ 4,
+      grepl("stage V$",   braak_stage) ~ 5, grepl("stage VI$",  braak_stage) ~ 6,
+      TRUE ~ NA_real_
+    ),
+    sample_id = case_when(
+      paper_id == "NCI_1" ~ "CTRL_4", paper_id == "NCI_2" ~ "CTRL_5",
+      paper_id == "NCI_3" ~ "CTRL_6", paper_id == "NCI_4" ~ "CTRL_7",
+      paper_id == "AD_1"  ~ "ADD_4",  paper_id == "AD_2"  ~ "ADD_5",
+      paper_id == "AD_3"  ~ "ADD_6",  paper_id == "AD_4"  ~ "ADD_7",
+      TRUE ~ paper_id
+    ),
+    group = case_when(
+      grepl("^NCI", paper_id) ~ "NCI", grepl("^AD_", paper_id) ~ "AD",
+      grepl("^DLB", paper_id) ~ "DLB", grepl("^PDD", paper_id) ~ "PDD"
+    ),
+    condition = case_when(
+      group == "AD"  & braak_numeric >= 5 ~ "AD",
+      group == "NCI" & braak_numeric <= 2 ~ "Control",
+      TRUE ~ NA_character_
+    ),
+    exclude_reason = case_when(
+      group %in% c("DLB", "PDD")         ~ "non-AD diagnosis",
+      group == "NCI" & braak_numeric == 3 ~ "Braak III",
+      TRUE ~ NA_character_
+    ),
+    include = is.na(exclude_reason),
+    region  = "PFC",
+    study   = "GSE303823"
+  ) %>%
+  select(sample_id, paper_id, group, diagnosis_raw, braak_stage,
+         braak_numeric, condition, include, exclude_reason, region, study)
+
+write.csv(lookup_table_full, file.path(output_dir, "gse303823_lookup_table.csv"), row.names = FALSE)
+
+# ------------------------------------------------------------------------------
+# 6.2  Load data and create Seurat object
+# ------------------------------------------------------------------------------
+
+included_samples <- lookup_table_full %>% filter(include) %>% pull(sample_id)
+
+raw_data     <- readRDS(rds_file)
+meta_full    <- raw_data$meta
+common_cells <- rownames(meta_full)[meta_full$sample %in% included_samples]
+
+lookup_index <- lookup_table_full %>%
+  filter(include) %>%
+  tibble::column_to_rownames("sample_id")
+
+seurat_obj <- CreateSeuratObject(counts    = raw_data$counts[, common_cells],
+                                 meta.data = meta_full[common_cells, ],
+                                 project   = "GSE303823",
+                                 min.cells = 10, min.features = 200)
+
+seurat_obj$study         <- "GSE303823"
+seurat_obj$sample_id     <- seurat_obj$sample
+seurat_obj$condition     <- lookup_index[seurat_obj$sample, "condition"]
+seurat_obj$braak_numeric <- lookup_index[seurat_obj$sample, "braak_numeric"]
+seurat_obj$region        <- "PFC"
+
+# ------------------------------------------------------------------------------
+# 6.3  QC filtering
+# ------------------------------------------------------------------------------
+
+seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = "^MT-")
+seurat_obj <- subset(seurat_obj,
+                     subset = nFeature_RNA > 200 & nFeature_RNA < 5000 & percent.mt < 10)
+
+saveRDS(seurat_obj, file.path(output_dir, "gse303823_azimuth_input.rds"))
+rm(raw_data, meta_full, braak_raw, lookup_table_full, lookup_index,
+   included_samples, common_cells, seurat_obj); gc()
+
+
+message("Step 1 complete. All Azimuth input objects saved to: ", output_dir)
