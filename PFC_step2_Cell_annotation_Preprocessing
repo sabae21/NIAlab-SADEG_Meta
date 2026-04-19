@@ -188,17 +188,16 @@ p_all <- DimPlot(
   pt.size    = 0.3,
   alpha      = 0.5
 ) +
-  labs(
-    title    = "All Cell Types - PFC Meta-Analysis (Harmony)",
-    subtitle = subtitle_text
-  ) +
+  labs(title = NULL, subtitle = NULL) +
   theme(
-    legend.text      = element_text(size = 10),
-    plot.subtitle    = element_text(size = 10, color = "grey40")
+    legend.text  = element_text(size = 10),
+    plot.title   = element_blank(),
+    plot.subtitle = element_blank()
   )
 
-ggsave(file.path(output_dir, "Figure1_AllCellTypes_UMAP.png"),
-       p_all, width = 12, height = 9, dpi = 300)
+ggsave(file.path(output_dir, "Figure1_AllCellTypes.png"),
+       p_all_clean, width = 12, height = 9, dpi = 300)
+
 
 # ==============================================================================
 # 4. Astrocyte Subsetting & Harmony Integration
