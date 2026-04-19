@@ -224,15 +224,15 @@ seurat_astro <- FindClusters(seurat_astro,  resolution = 0.4)
 
 p1 <- DimPlot(seurat_astro, reduction = "umap", group.by = "study",
               raster = FALSE, alpha = 0.6) +
-  ggtitle("Astrocyte Integration by Study")
+  ggtitle(NULL)
 
 p2 <- DimPlot(seurat_astro, reduction = "umap", group.by = "seurat_clusters",
               label = TRUE, raster = FALSE) +
-  ggtitle("Astrocyte Sub-clusters")
+  ggtitle(NULL)
 
 p3 <- DimPlot(seurat_astro, reduction = "umap", split.by = "study",
               group.by = "study", ncol = 3, pt.size = 0.01, raster = FALSE) +
-  NoLegend() + ggtitle("Integration Check by Study")
+  NoLegend() + ggtitle(NULL)
 
 ggsave(file.path(output_dir, "Figure1_Astrocyte_Integration.png"),
        p1, width = 10, height = 7, dpi = 300)
