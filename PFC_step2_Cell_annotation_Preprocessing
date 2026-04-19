@@ -1,0 +1,254 @@
+################################################################################
+# Script Name: 02_PFC_Cell_Annotation_and_Preprocessing.R
+# Description: Two-step cell type annotation — Azimuth reference mapping
+#              followed by BRETIGEA marker-based confirmation and hybrid cell
+#              removal — astrocyte subsetting, and Harmony batch correction.
+#              Datasets: GSE157827, GSE167494, GSE214979, GSE268599, GSE303823.
+# Reference:   Bakken et al., Nature 2021 (Azimuth Human Motor Cortex)
+# Version:     1.0
+################################################################################
+
+# ==============================================================================
+# 0. Setup
+# ==============================================================================
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Azimuth)
+  library(SeuratObject)
+  library(BRETIGEA)
+  library(dplyr)
+  library(harmony)
+  library(ggplot2)
+  library(patchwork)
+  library(scales)
+})
+
+input_dir  <- "~/meta_analysis/results/PFC/2026.04"
+output_dir <- "~/meta_analysis/results/PFC/2026.04"
+ref_dir    <- "~/meta_analysis/azimuth_references"
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(ref_dir,    recursive = TRUE, showWarnings = FALSE)
+
+# Azimuth Human Motor Cortex reference (Bakken et al., 2021; Allen Institute)
+# https://azimuth.hubmapconsortium.org/references/human_motorcortex/
+if (!file.exists(file.path(ref_dir, "idx.annoy"))) {
+  options(timeout = 3600)
+  download.file(
+    "https://zenodo.org/records/4546932/files/idx.annoy?download=1",
+    destfile = file.path(ref_dir, "idx.annoy"), mode = "wb"
+  )
+  download.file(
+    "https://zenodo.org/records/4546932/files/ref.Rds?download=1",
+    destfile = file.path(ref_dir, "ref.Rds"), mode = "wb"
+  )
+}
+
+# ==============================================================================
+# 1. Azimuth Annotation
+# ==============================================================================
+datasets <- c("gse157827", "gse167494", "gse214979", "gse268599", "gse303823")
+obj_list <- list()
+
+for (ds in datasets) {
+  file_path <- file.path(input_dir, paste0(ds, "_azimuth_input.rds"))
+  if (!file.exists(file_path)) {
+    warning(paste("File not found:", file_path, "- Skipping."))
+    next
+  }
+
+  obj             <- readRDS(file_path)
+  obj[["RNA"]]    <- JoinLayers(obj[["RNA"]])
+  obj$study       <- toupper(ds)
+  obj             <- RunAzimuth(obj, reference = ref_dir)
+  obj$final_label <- obj$predicted.subclass
+
+  # Retain counts and data layers only; drop Azimuth reductions to save memory
+  obj <- DietSeurat(obj, layers = c("counts", "data"), dimreducs = NULL, graphs = NULL)
+
+  obj_list[[ds]] <- obj
+  rm(obj); gc()
+}
+
+# ==============================================================================
+# 2. Merge
+# ==============================================================================
+combined <- merge(
+  x            = obj_list[[1]],
+  y            = obj_list[-1],
+  add.cell.ids = names(obj_list),
+  project      = "Meta_Analysis_PFC_v1"
+)
+rm(obj_list); gc()
+
+combined <- JoinLayers(combined)
+gc()
+
+# ==============================================================================
+# 3. Hybrid Cell Detection (BRETIGEA)
+# ==============================================================================
+# Module scores are computed for all eight brain cell types using top-50 markers.
+# Hybrid cells are defined as those with a normalized score gap (hybrid_ratio)
+# below 0.2 between the top and second-ranked cell type:
+#   hybrid_ratio = (max_score - 2nd_score) / max_score
+
+data("markers_df_human_brain", package = "BRETIGEA")
+cell_types    <- unique(markers_df_human_brain$cell)
+brain_markers <- lapply(cell_types, function(ct) {
+  head(markers_df_human_brain$markers[markers_df_human_brain$cell == ct], 50)
+})
+names(brain_markers) <- cell_types
+
+combined <- NormalizeData(combined)
+combined <- AddModuleScore(combined, features = brain_markers, name = "BRET_")
+
+# Map generated columns to cell type names in input order
+score_cols <- paste0("BRET_", seq_along(cell_types))
+if (!all(score_cols %in% colnames(combined@meta.data))) {
+  stop(sprintf(
+    "BRETIGEA score column mismatch: expected %s",
+    paste(score_cols, collapse = ", ")
+  ))
+}
+colnames(combined@meta.data)[
+  colnames(combined@meta.data) %in% score_cols
+] <- paste0("Score_", cell_types)
+
+score_mat              <- as.matrix(combined@meta.data[, paste0("Score_", cell_types)])
+combined$max_score     <- apply(score_mat, 1, max)
+combined$sec_score     <- apply(score_mat, 1, function(x) sort(x, decreasing = TRUE)[2])
+combined$hybrid_ratio  <- ifelse(
+  combined$max_score > 0,
+  (combined$max_score - combined$sec_score) / combined$max_score,
+  1
+)
+combined$is_hybrid     <- combined$hybrid_ratio < 0.2
+combined$bret_top_cell <- cell_types[apply(score_mat, 1, which.max)]
+combined$final_label   <- ifelse(combined$is_hybrid, "Hybrid", combined$final_label)
+
+message(sprintf("Hybrid cells flagged: %d of %d total", sum(combined$is_hybrid), ncol(combined)))
+
+# ==============================================================================
+# 3b. Cell Annotation Summary
+# ==============================================================================
+total_cells <- ncol(combined)
+
+annotation_summary <- as.data.frame(table(final_label = combined$final_label)) %>%
+  rename(cell_type = final_label, n_cells = Freq) %>%
+  mutate(percentage = round(n_cells / total_cells * 100, 2)) %>%
+  arrange(desc(n_cells))
+
+astro_row  <- annotation_summary %>% filter(cell_type == "Astro")
+other_rows <- annotation_summary %>% filter(cell_type != "Astro")
+annotation_summary <- bind_rows(
+  astro_row,
+  other_rows,
+  data.frame(cell_type = "Total", n_cells = total_cells, percentage = 100.00)
+)
+
+write.csv(
+  annotation_summary,
+  file.path(output_dir, "cell_annotation_summary.csv"),
+  row.names = FALSE
+)
+
+# ==============================================================================
+# 3c. All Cell Types - UMAP Overview
+# ==============================================================================
+combined <- FindVariableFeatures(combined, selection.method = "vst", nfeatures = 2000)
+combined <- ScaleData(combined, features = VariableFeatures(combined), verbose = FALSE)
+combined <- RunPCA(combined, npcs = 30, verbose = FALSE)
+combined <- RunHarmony(combined, group.by.vars = "study", plot_convergence = FALSE)
+combined <- RunUMAP(combined, reduction = "harmony", dims = 1:30, verbose = FALSE)
+
+cell_type_levels <- sort(unique(combined$final_label))
+cell_type_cols   <- setNames(hue_pal()(length(cell_type_levels)), cell_type_levels)
+
+p_all <- DimPlot(
+  combined, reduction = "umap", group.by = "final_label",
+  label = TRUE, label.size = 4, repel = TRUE,
+  raster = FALSE, cols = cell_type_cols, pt.size = 0.3, alpha = 0.5
+) +
+  ggtitle("All Cell Types - PFC Meta-Analysis (Harmony)") +
+  theme(legend.text = element_text(size = 10))
+
+p_cond <- DimPlot(
+  combined, reduction = "umap", group.by = "final_label",
+  split.by = "condition", label = TRUE, label.size = 3, repel = TRUE,
+  raster = FALSE, cols = cell_type_cols, pt.size = 0.2, alpha = 0.4, ncol = 2
+) +
+  ggtitle("All Cell Types by Condition (AD vs. Control)") +
+  theme(legend.text = element_text(size = 9))
+
+ggsave(file.path(output_dir, "Figure1_AllCellTypes_UMAP.png"),
+       p_all,  width = 12, height = 9, dpi = 300)
+ggsave(file.path(output_dir, "Figure1_AllCellTypes_UMAP_by_Condition.png"),
+       p_cond, width = 18, height = 8, dpi = 300)
+
+# ==============================================================================
+# 4. Astrocyte Subsetting & Harmony Integration
+# ==============================================================================
+# Dual-evidence astrocyte selection:
+#   (1) Azimuth label     == "Astro"  (reference-mapping confirmation)
+#   (2) BRETIGEA top cell == "ast"    (marker-score confirmation)
+#   (3) Not hybrid: hybrid cells already relabeled "Hybrid" in Section 3
+seurat_astro <- subset(
+  combined,
+  subset = final_label == "Astro" & bret_top_cell == "ast"
+)
+rm(combined); gc()
+
+if (ncol(seurat_astro) < 100) stop("Insufficient astrocytes for analysis.")
+message(sprintf("Astrocytes retained: %d cells", ncol(seurat_astro)))
+
+seurat_astro <- NormalizeData(seurat_astro)
+seurat_astro <- FindVariableFeatures(seurat_astro, selection.method = "vst", nfeatures = 2000)
+seurat_astro <- ScaleData(seurat_astro, features = VariableFeatures(seurat_astro), verbose = FALSE)
+seurat_astro <- RunPCA(seurat_astro, npcs = 30, verbose = FALSE)
+seurat_astro <- RunHarmony(seurat_astro, group.by.vars = "study", plot_convergence = FALSE)
+seurat_astro <- RunUMAP(seurat_astro,      reduction = "harmony", dims = 1:30, verbose = FALSE)
+seurat_astro <- FindNeighbors(seurat_astro, reduction = "harmony", dims = 1:30)
+seurat_astro <- FindClusters(seurat_astro,  resolution = 0.4)
+
+p1 <- DimPlot(seurat_astro, reduction = "umap", group.by = "study",
+              raster = FALSE, alpha = 0.6) +
+  ggtitle("Astrocyte Integration by Study")
+
+p2 <- DimPlot(seurat_astro, reduction = "umap", group.by = "seurat_clusters",
+              label = TRUE, raster = FALSE) +
+  ggtitle("Astrocyte Sub-clusters")
+
+p3 <- DimPlot(seurat_astro, reduction = "umap", split.by = "study",
+              group.by = "study", ncol = 3, pt.size = 0.01, raster = FALSE) +
+  NoLegend() + ggtitle("Integration Check by Study")
+
+ggsave(file.path(output_dir, "Figure1_Astrocyte_Integration.png"),
+       p1, width = 10, height = 7, dpi = 300)
+ggsave(file.path(output_dir, "Figure1_Astrocyte_Subclusters.png"),
+       p2, width = 10, height = 7, dpi = 300)
+ggsave(file.path(output_dir, "Figure1_Astrocyte_Integration_by_Study.png"),
+       p3, width = 16, height = 6, dpi = 300)
+
+# ==============================================================================
+# 5. Save
+# ==============================================================================
+saveRDS(seurat_astro, file.path(output_dir, "seurat_astro_integrated.rds"))
+
+name_map <- c(
+  "GSE157827" = "lau",
+  "GSE167494" = "sadick",
+  "GSE214979" = "anderson",
+  "GSE268599" = "serrano",
+  "GSE303823" = "chia"
+)
+
+# Per-study objects retain integrated metadata and Harmony reduction;
+# intended for study-level QC and supplementary validation.
+obj_list_final <- SplitObject(seurat_astro, split.by = "study")
+for (study_id in names(obj_list_final)) {
+  author   <- ifelse(!is.na(name_map[study_id]), name_map[study_id], tolower(study_id))
+  out_path <- file.path(output_dir, sprintf("seurat_%s_preprocessed.rds", author))
+  saveRDS(obj_list_final[[study_id]], out_path)
+}
+
+message("Script 02 complete.")
