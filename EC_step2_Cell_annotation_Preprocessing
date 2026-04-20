@@ -1,0 +1,183 @@
+# ==============================================================================
+# Project: Meta-analysis of Alzheimer's Disease (Entorhinal Cortex)
+# Script Name: 02_EC_Cell_Annotation_and_Preprocessing.R
+# Description: Performs automated cell annotation (Azimuth), hybrid detection 
+#              (BRETIGEA), global visualization, astrocyte extraction, and 
+#              batch correction (Harmony) for EC datasets.
+# ==============================================================================
+
+# ==============================================================================
+# 1. Setup and Environment
+# ==============================================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Azimuth)
+  library(BRETIGEA)
+  library(dplyr)
+  library(harmony)
+  library(ggplot2)
+  library(patchwork)
+  library(future)
+})
+
+plan("sequential")
+options(future.globals.maxSize = 8000 * 1024^2)
+
+cblas_lib_path <- paste0(Sys.getenv("HOME"), "/local/lib/libgslcblas.so.0")
+if(file.exists(cblas_lib_path)) dyn.load(cblas_lib_path)
+
+gsl_lib_path <- paste0(Sys.getenv("HOME"), "/local/lib/libgsl.so.27")
+if(file.exists(gsl_lib_path)) dyn.load(gsl_lib_path)
+
+input_dir  <- "~/meta_analysis/results/EC/new_control_standard/2026_04/Azimuth_input/"
+ref_path   <- "~/meta_analysis/azimuth_references"
+fig_dir    <- "~/meta_analysis/results/EC/new_control_standard/2026_04/Figures/"
+
+if (!dir.exists(fig_dir)) dir.create(fig_dir, recursive = TRUE)
+
+# ==============================================================================
+# 2. Automated Annotation (Azimuth)
+# ==============================================================================
+message(">>> Running Azimuth for Automated Annotation...")
+
+seurat_grubman <- readRDS(paste0(input_dir, "grubman_azimuth_input.rds"))
+seurat_leng    <- readRDS(paste0(input_dir, "leng_azimuth_input.rds"))
+seurat_serrano <- readRDS(paste0(input_dir, "serrano_azimuth_input.rds"))
+
+seurat_grubman <- RunAzimuth(seurat_grubman, reference = ref_path)
+seurat_grubman$final_label <- seurat_grubman$predicted.subclass
+
+seurat_leng <- RunAzimuth(seurat_leng, reference = ref_path)
+seurat_leng$final_label <- seurat_leng$predicted.subclass
+
+seurat_serrano <- RunAzimuth(seurat_serrano, reference = ref_path)
+seurat_serrano$final_label <- seurat_serrano$predicted.subclass
+
+# ==============================================================================
+# 3. Data Integration & Pre-processing
+# ==============================================================================
+message(">>> Merging Data and Running Initial Pre-processing...")
+
+clean_diet <- function(obj) {
+  DietSeurat(obj, counts = TRUE, data = TRUE, scale.data = FALSE, dimreducs = NULL, graphs = NULL)
+}
+
+seurat_grubman <- clean_diet(seurat_grubman)
+seurat_leng    <- clean_diet(seurat_leng)
+seurat_serrano <- clean_diet(seurat_serrano)
+
+combined <- merge(x = seurat_grubman, y = c(seurat_leng, seurat_serrano),
+                  add.cell.ids = c("Grubman", "Leng", "Serrano"), project = "EC_Meta")
+
+rm(seurat_grubman, seurat_leng, seurat_serrano)
+gc()
+
+combined <- JoinLayers(combined)
+
+combined <- NormalizeData(combined)
+combined <- FindVariableFeatures(combined, selection.method = "vst", nfeatures = 2000)
+combined <- ScaleData(combined)
+
+# ==============================================================================
+# 4. Semi-Manual Annotation (BRETIGEA Scoring & Hybrid Detection)
+# ==============================================================================
+message(">>> Running BRETIGEA for Hybrid Cell Detection...")
+
+data("markers_df_human_brain", package = "BRETIGEA")
+cell_types <- unique(markers_df_human_brain$cell)
+brain_markers <- list()
+
+for (ct in cell_types) {
+  genes <- markers_df_human_brain$markers[markers_df_human_brain$cell == ct]
+  brain_markers[[ct]] <- head(genes, 50)
+}
+
+combined <- AddModuleScore(combined, features = brain_markers, name = "BRET_Score")
+
+score_cols <- paste0("Score_", names(brain_markers))
+for(i in seq_along(score_cols)) {
+  target_col <- paste0("BRET_Score", i)
+  if (target_col %in% colnames(combined@meta.data)) {
+    colnames(combined@meta.data)[colnames(combined@meta.data) == target_col] <- score_cols[i]
+  }
+}
+
+score_mat <- combined@meta.data[, score_cols]
+combined$max_score  <- apply(score_mat, 1, max)
+combined$second_max <- apply(score_mat, 1, function(x) sort(x, decreasing = TRUE)[2])
+combined$is_hybrid  <- (combined$max_score - combined$second_max) / combined$max_score < 0.2
+
+combined$final_label[combined$is_hybrid] <- "Hybrid"
+
+# ==============================================================================
+# 5. Global Visualization
+# ==============================================================================
+message(">>> Generating Global Cell Type Overview...")
+
+combined <- RunPCA(combined, verbose = FALSE)
+combined <- RunUMAP(combined, dims = 1:30, verbose = FALSE)
+
+p_global <- DimPlot(combined, reduction = "umap", group.by = "final_label", 
+                    label = TRUE, label.size = 3, raster = FALSE, repel = TRUE) +
+  ggtitle("Global Cell Type Overview") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  NoLegend()
+
+ggsave(file.path(fig_dir, "Figure0_Global_Cell_Type_Overview.png"), p_global, width = 12, height = 10, dpi = 300)
+
+# ==============================================================================
+# 6. Astrocyte Subsetting & Re-processing
+# ==============================================================================
+message(">>> Subsetting Astrocytes and Re-processing...")
+
+seurat_astro <- subset(combined, subset = final_label == "Astro" & is_hybrid == FALSE)
+
+rm(combined)
+gc()
+
+seurat_astro <- FindVariableFeatures(seurat_astro, selection.method = "vst", nfeatures = 2000)
+seurat_astro <- ScaleData(seurat_astro)
+seurat_astro <- RunPCA(seurat_astro, npcs = 30, verbose = FALSE)
+
+seurat_astro <- RunHarmony(seurat_astro, group.by.vars = "study", plot_convergence = FALSE)
+
+seurat_astro <- RunUMAP(seurat_astro, reduction = "harmony", dims = 1:30)
+seurat_astro <- FindNeighbors(seurat_astro, reduction = "harmony", dims = 1:30)
+seurat_astro <- FindClusters(seurat_astro, resolution = 0.4)
+
+# ==============================================================================
+# 7. Astrocyte Integration Visualization
+# ==============================================================================
+message(">>> Generating Astrocyte UMAP Visualizations...")
+
+p1 <- DimPlot(seurat_astro, reduction = "umap", group.by = "study", raster = FALSE, alpha = 0.6) + 
+  ggtitle("Astrocyte Integration (By Study)")
+
+p2 <- DimPlot(seurat_astro, reduction = "umap", group.by = "seurat_clusters", label = TRUE) +
+  ggtitle("Astrocyte Sub-clusters")
+
+p3 <- DimPlot(seurat_astro, reduction = "umap", split.by = "study", group.by = "study", ncol = 3, pt.size = 0.01, raster = FALSE) +    
+  NoLegend() + ggtitle("Integration Check by Study")
+
+ggsave(file.path(fig_dir, "Figure1_Astrocyte_Integration.png"), p1, width = 10, height = 7)
+ggsave(file.path(fig_dir, "Figure1_Astrocyte_subclusters.png"), p2, width = 10, height = 7)
+ggsave(file.path(fig_dir, "Figure1_Astrocyte_Integration_check_by_study.png"), p3, width = 10, height = 7)
+
+# ==============================================================================
+# 8. Object Splitting & Final Export
+# ==============================================================================
+message(">>> Saving Final Objects...")
+
+obj_list <- SplitObject(seurat_astro, split.by = "study")
+
+seurat_grubman_final <- obj_list[["Grubman et al"]]
+seurat_leng_final    <- obj_list[["Leng et al"]]
+seurat_serrano_final <- obj_list[["Serrano-Pozo et al"]]
+
+saveRDS(seurat_astro,         file = paste0(input_dir, "EC_astro_integrated_final.rds"))
+saveRDS(seurat_grubman_final, file = paste0(input_dir, "EC_astro_grubman_final.rds"))
+saveRDS(seurat_leng_final,    file = paste0(input_dir, "EC_astro_leng_final.rds"))
+saveRDS(seurat_serrano_final, file = paste0(input_dir, "EC_astro_serrano_final.rds"))
+
+message(">>> Step 2 Pipeline Completed Successfully.")
