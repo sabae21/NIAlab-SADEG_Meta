@@ -1,0 +1,148 @@
+################################################################################
+# Script: 03_PFC_Differential_Expression_Analysis.R
+# Description: Pseudo-bulk DEA (limma-voom) on astrocyte subsets per study.
+#              Control selection: Diagnosis Control + Braak 0-II (4 datasets).
+# Input:  seurat_*_preprocessed.rds (output of Script 02)
+# Output: DEA_GSE######_<study>.csv (logFC, SE, P-value, FDR per gene per study)
+################################################################################
+
+# ==============================================================================
+# 1. Setup
+# ==============================================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(edgeR)
+  library(limma)
+  library(dplyr)
+  library(tibble)
+})
+
+input_dir  <- "~/meta_analysis/results/PFC/2026.04/"
+output_dir <- "~/meta_analysis/results/PFC/2026.04/DEA_Results/"
+
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+# ==============================================================================
+# 2. DEA Pipeline Function
+# ==============================================================================
+
+run_limma_voom_pipeline <- function(obj, study_name) {
+  
+  message(sprintf("\n>>> Processing: [%s]", study_name))
+  
+  if (!"sample_id" %in% colnames(obj@meta.data))
+    stop(paste("Missing 'sample_id' column:", study_name))
+  
+  if (!all(c("AD", "Control") %in% unique(obj$condition))) {
+    warning(paste("Skipping", study_name, "— missing AD or Control group."))
+    return(NULL)
+  }
+  
+  obj_clean         <- subset(obj, subset = condition %in% c("AD", "Control"))
+  clean_ids         <- gsub("[^a-zA-Z0-9]", ".", obj_clean$sample_id)
+  obj_clean$safe_id <- paste0("S.", clean_ids)
+  
+  meta_summary <- obj_clean@meta.data %>%
+    dplyr::select(safe_id, condition) %>%
+    distinct() %>%
+    group_by(safe_id) %>%
+    slice(1) %>%
+    ungroup() %>%
+    remove_rownames() %>%
+    column_to_rownames("safe_id")
+  
+  pb <- AggregateExpression(
+    obj_clean, group.by = "safe_id",
+    assays = "RNA", slot = "counts", return.seurat = FALSE
+  )
+  pb_counts <- pb$RNA
+  
+  common_samples <- intersect(colnames(pb_counts), rownames(meta_summary))
+  if (length(common_samples) < 2) {
+    warning(paste("Insufficient matched samples in", study_name))
+    return(NULL)
+  }
+  
+  pb_counts    <- pb_counts[, common_samples]
+  meta_summary <- meta_summary[common_samples, , drop = FALSE]
+  
+  ad_n   <- sum(meta_summary$condition == "AD")
+  ctrl_n <- sum(meta_summary$condition == "Control")
+  message(sprintf("    Samples: %d total (AD: %d / Control: %d)", ncol(pb_counts), ad_n, ctrl_n))
+  
+  if (ad_n < 2 || ctrl_n < 2) {
+    warning("Skipping — insufficient samples (need >= 2 per group).")
+    return(NULL)
+  }
+  
+  y      <- DGEList(counts = pb_counts, samples = meta_summary)
+  group  <- factor(y$samples$condition, levels = c("Control", "AD"))
+  design <- model.matrix(~0 + group)
+  colnames(design) <- levels(group)
+  
+  keep <- rowSums(cpm(y) > 0.5) >= 2
+  message(sprintf("    Genes retained after filtering: %d", sum(keep)))
+  if (sum(keep) < 100) {
+    warning("Skipping — too few genes passed filtering.")
+    return(NULL)
+  }
+  
+  y    <- y[keep, , keep.lib.sizes = FALSE]
+  y    <- calcNormFactors(y, method = "TMM")
+  v    <- voom(y, design, plot = FALSE)
+  fit  <- lmFit(v, design)
+  
+  cont.matrix <- makeContrasts(AD_vs_Ctrl = AD - Control, levels = design)
+  fit2 <- contrasts.fit(fit, cont.matrix)
+  fit2 <- eBayes(fit2)
+  
+  res       <- topTable(fit2, coef = "AD_vs_Ctrl", number = Inf, sort.by = "none")
+  res$SE    <- sqrt(fit2$s2.post) * fit2$stdev.unscaled[, "AD_vs_Ctrl"]
+  res$gene  <- rownames(res)
+  res$study <- study_name
+  
+  res <- res %>%
+    dplyr::select(gene, study, logFC, SE, P.Value, adj.P.Val, everything()) %>%
+    dplyr::rename(PValue = P.Value, FDR = adj.P.Val)
+  
+  return(res)
+}
+
+# ==============================================================================
+# 3. Main Execution Loop
+# ==============================================================================
+
+files_map <- list(
+  list(file = "seurat_lau_preprocessed.rds",     study = "Lau",     gse = "GSE157827"),
+  list(file = "seurat_sadick_preprocessed.rds",  study = "Sadick",  gse = "GSE167494"),
+  list(file = "seurat_serrano_preprocessed.rds", study = "Serrano", gse = "GSE268599"),
+  list(file = "seurat_chia_preprocessed.rds",    study = "Chia",    gse = "GSE303823")
+)
+
+message(">>> Starting DEA Pipeline...")
+
+for (entry in files_map) {
+  study_name <- entry$study
+  gse_id     <- entry$gse
+  file_path  <- file.path(input_dir, entry$file)
+  
+  if (!file.exists(file_path)) {
+    warning(paste("File not found, skipping:", entry$file))
+    next
+  }
+  
+  seurat_obj <- readRDS(file_path)
+  dea_res    <- run_limma_voom_pipeline(seurat_obj, study_name)
+  
+  if (!is.null(dea_res)) {
+    out_csv <- file.path(output_dir,
+                         sprintf("DEA_%s_%s.csv", gse_id, tolower(study_name)))
+    write.csv(dea_res, out_csv, row.names = FALSE)
+    message(sprintf("    Saved: %s", basename(out_csv)))
+  }
+  
+  rm(seurat_obj, dea_res); gc()
+}
+
+message("\n>>> DEA pipeline complete.")
