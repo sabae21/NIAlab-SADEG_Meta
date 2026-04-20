@@ -1,0 +1,107 @@
+################################################################################
+# Script: 05_PFC_Overlap_Analysis_SAGs.R
+# Description: Hypergeometric enrichment test for overlap between astrocyte
+#              meta-DEGs and Senescence-Associated Genes (SAGs).
+# Input:  Meta-analysis results (.csv), SAG reference list (.csv)
+# Output: Overlap gene list (.csv), hypergeometric test summary (.csv)
+################################################################################
+
+# ==============================================================================
+# 1. Setup
+# ==============================================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+})
+
+input_dir  <- "~/meta_analysis/results/PFC/2026.04/Meta_Analysis/"
+output_dir <- "~/meta_analysis/results/PFC/2026.04/Overlap_Results/"
+sags_path  <- "~/meta_analysis/NewSAGs_Unique.csv"
+
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+message(">>> Loading datasets...")
+
+# ==============================================================================
+# 2. Load Data
+# ==============================================================================
+
+if (!file.exists(sags_path)) stop("SAGs file not found.")
+
+sags_raw <- read.csv(sags_path, stringsAsFactors = FALSE)
+sags_col <- colnames(sags_raw)[grep("gene|symbol", colnames(sags_raw), ignore.case = TRUE)][1]
+if (is.na(sags_col)) stop("Could not identify gene column in SAGs file.")
+
+sags_list <- unique(toupper(trimws(sags_raw[[sags_col]])))
+message(sprintf("    SAGs loaded: %d", length(sags_list)))
+
+# Input filenames updated to match Script 04 output
+meta_degs_df <- read.csv(file.path(input_dir, "PFC_metaDEGs_Significant.csv"))
+meta_up_df   <- read.csv(file.path(input_dir, "PFC_metaDEGs_Upregulated.csv"))
+meta_down_df <- read.csv(file.path(input_dir, "PFC_metaDEGs_Downregulated.csv"))
+universe_df  <- read.csv(file.path(input_dir, "PFC_metaDEGs_All_Results.csv"))
+
+meta_degs_genes <- toupper(trimws(meta_degs_df$gene))
+meta_up_genes   <- toupper(trimws(meta_up_df$gene))
+meta_down_genes <- toupper(trimws(meta_down_df$gene))
+universe_genes  <- toupper(trimws(universe_df$gene))
+
+message(sprintf("    Background universe  : %d genes", length(universe_genes)))
+message(sprintf("    Significant meta-DEGs: %d genes", length(meta_degs_genes)))
+
+# ==============================================================================
+# 3. Hypergeometric Enrichment Test
+# ==============================================================================
+message(">>> Running hypergeometric tests...")
+
+N               <- length(universe_genes)
+sag_in_universe <- intersect(sags_list, universe_genes)
+M               <- length(sag_in_universe)
+
+message(sprintf("    SAGs within universe (M): %d", M))
+
+run_hypergeo_test <- function(deg_genes, label) {
+  n             <- length(deg_genes)
+  overlap_genes <- intersect(deg_genes, sag_in_universe)
+  k             <- length(overlap_genes)
+  p_val         <- phyper(k - 1, M, N - M, n, lower.tail = FALSE)
+  
+  message(sprintf("    [%s] n=%d | overlap k=%d | p=%s",
+                  label, n, k, format.pval(p_val, digits = 4)))
+  
+  list(p_val = p_val, overlap = overlap_genes)
+}
+
+res_all  <- run_hypergeo_test(meta_degs_genes, "All DEGs")
+res_up   <- run_hypergeo_test(meta_up_genes,   "Upregulated")
+res_down <- run_hypergeo_test(meta_down_genes, "Downregulated")
+
+# ==============================================================================
+# 4. Export Results
+# ==============================================================================
+message(">>> Saving results...")
+
+overlap_final_df <- meta_degs_df %>%
+  dplyr::filter(toupper(trimws(gene)) %in% res_all$overlap) %>%
+  dplyr::mutate(direction = ifelse(beta_meta > 0, "Up", "Down")) %>%
+  dplyr::select(gene, direction, everything())
+
+write.csv(overlap_final_df,
+          file.path(output_dir, "PFC_SAGs_Overlap_Detailed.csv"),
+          row.names = FALSE)
+
+summary_df <- data.frame(
+  category           = c("All DEGs", "Upregulated", "Downregulated"),
+  universe_N         = N,
+  SAGs_in_universe_M = M,
+  DEGs_n             = c(length(meta_degs_genes), length(meta_up_genes), length(meta_down_genes)),
+  overlap_k          = c(length(res_all$overlap), length(res_up$overlap), length(res_down$overlap)),
+  p_value            = c(res_all$p_val, res_up$p_val, res_down$p_val)
+)
+
+write.csv(summary_df,
+          file.path(output_dir, "PFC_SAGs_Hypergeometric_Summary.csv"),
+          row.names = FALSE)
+
+message("\n>>> Script 05 complete.")
