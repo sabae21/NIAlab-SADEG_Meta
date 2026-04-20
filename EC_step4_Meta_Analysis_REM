@@ -1,0 +1,196 @@
+# ==============================================================================
+# Project: Meta-analysis of Alzheimer's Disease (Entorhinal Cortex)
+# Script Name: 04_EC_Meta_Analysis_REM.R
+# Description: Performs meta-analysis using Random-Effects Model (REM) on 
+#              Limma-voom differential expression results from 3 EC datasets.
+# Input:       DEA results (.csv) from Script 03.
+# Output:      Meta-analysis results including combined logFC, SE, and FDR.
+# ==============================================================================
+
+# ==============================================================================
+# 1. Setup and Environment
+# ==============================================================================
+
+# Load required libraries
+if (!requireNamespace("metafor", quietly = TRUE)) install.packages("metafor")
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(metafor)
+})
+
+# Define directory paths
+input_dir  <- "~/meta_analysis/results/EC/new_control_standard/2026_03/basic_filtering/DEA_Results/"
+output_dir <- "~/meta_analysis/results/EC/new_control_standard/2026_03/basic_filtering/Meta_Analysis/"
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+# ==============================================================================
+# 2. Data Loading and Harmonization
+# ==============================================================================
+message(">>> Loading and merging datasets...")
+
+studies <- c("Grubman", "Leng", "Serrano")
+deg_list <- list()
+
+# Load CSV files and standardize column names
+for (study in studies) {
+  file_name <- paste0("limmavoom_DEG_", study, ".csv")
+  file_path <- file.path(input_dir, file_name)
+  
+  if (file.exists(file_path)) {
+    df <- read.csv(file_path)
+    
+    # Rename columns to include study suffix for merging
+    df_clean <- df %>%
+      dplyr::select(gene, logFC, SE, PValue, FDR) %>%
+      dplyr::rename(
+        !!paste0("lfc_", tolower(study)) := logFC,
+        !!paste0("se_", tolower(study))  := SE,
+        !!paste0("pval_", tolower(study)) := PValue,
+        !!paste0("padj_", tolower(study)) := FDR
+      )
+    
+    deg_list[[study]] <- df_clean
+    message(paste("    - Loaded:", study, "(Genes:", nrow(df_clean), ")"))
+  } else {
+    warning(paste("Missing file for:", study))
+  }
+}
+
+if (length(deg_list) < 3) warning("Warning: Not all 3 studies were successfully loaded.")
+
+# Merge datasets (Intersection Strategy)
+# Only genes present in ALL studies are retained to ensure robustness.
+meta_input <- Reduce(function(x, y) merge(x, y, by = "gene"), deg_list)
+
+message(paste(">>> Total common genes for Meta-analysis:", nrow(meta_input)))
+
+if (nrow(meta_input) < 100) stop("Error: Too few common genes. Check gene identifiers.")
+
+# Save merged input for reproducibility
+write.csv(meta_input, file.path(output_dir, "EC_meta_input_3studies.csv"), row.names = FALSE)
+
+# ==============================================================================
+# 3. Meta-Analysis (Random-Effects Model)
+# ==============================================================================
+message(">>> Running Random-Effects Model (REML)...")
+
+meta_results <- list()
+n_total <- nrow(meta_input)
+
+for (i in 1:n_total) {
+  
+  gene_name <- meta_input$gene[i]
+  
+  # Extract Effect Sizes (logFC) and Standard Errors (SE)
+  yi <- c(
+    meta_input$lfc_grubman[i], 
+    meta_input$lfc_leng[i], 
+    meta_input$lfc_serrano[i]
+  )
+  
+  sei <- c(
+    meta_input$se_grubman[i], 
+    meta_input$se_leng[i], 
+    meta_input$se_serrano[i]
+  )
+  
+  # Execute REML (Restricted Maximum Likelihood)
+  res <- tryCatch({
+    rma(yi = yi, sei = sei, method = "REML")
+  }, error = function(e) return(NULL))
+  
+  # Store results
+  if (!is.null(res)) {
+    meta_results[[i]] <- data.frame(
+      Gene      = gene_name,
+      beta_meta = res$beta,       # Combined Log2FC
+      se_meta   = res$se,         # Combined SE
+      p_meta    = res$pval,       # Combined P-value
+      ci_lb     = res$ci.lb,      # 95% CI Lower Bound
+      ci_ub     = res$ci.ub,      # 95% CI Upper Bound
+      I2        = res$I2,         # Heterogeneity (%)
+      tau2      = res$tau2,       # Between-study variance
+      n_studies = res$k           # Number of included studies
+    )
+  }
+  
+  # Progress indicator
+  if (i %% 1000 == 0) message(paste("    Processed:", i, "/", n_total, "genes"))
+}
+
+# Bind all results
+meta_final_df <- do.call(rbind, meta_results)
+
+# Multiple Testing Correction (FDR)
+meta_final_df$padj_meta <- p.adjust(meta_final_df$p_meta, method = "fdr")
+
+# Sort by significance
+meta_final_df <- meta_final_df[order(meta_final_df$p_meta), ]
+
+# Save full results
+write.csv(meta_final_df, file.path(output_dir, "EC_metaDEGs_All_Results.csv"), row.names = FALSE)
+message(">>> Meta-analysis completed. Results saved.")
+
+# ==============================================================================
+# 4. Filtering and Classification
+# ==============================================================================
+message(">>> Filtering significant DEGs (FDR < 0.05)...")
+
+# Significant DEGs
+meta_degs <- subset(meta_final_df, padj_meta < 0.05)
+message(paste("    Total Significant DEGs:", nrow(meta_degs)))
+
+# Directionality
+meta_up   <- subset(meta_degs, beta_meta > 0)
+meta_down <- subset(meta_degs, beta_meta < 0)
+
+message(paste("    - Upregulated:", nrow(meta_up)))
+message(paste("    - Downregulated:", nrow(meta_down)))
+
+# Save filtered lists
+write.csv(meta_degs, file.path(output_dir, "Meta_EC_ADastroDEGs_Final.csv"), row.names = FALSE)
+write.csv(meta_up,   file.path(output_dir, "Meta_EC_ADastroDEGs_Up.csv"), row.names = FALSE)
+write.csv(meta_down, file.path(output_dir, "Meta_EC_ADastroDEGs_Down.csv"), row.names = FALSE)
+
+# ==============================================================================
+# 5. Validation: Overlap with SAGs (Senescence-Associated Genes)
+# ==============================================================================
+message("\n>>> Validating overlap with SAGs reference list...")
+
+sags_path <- "~/meta_analysis/SAGs.csv" 
+
+if (file.exists(sags_path)) {
+  sags_df <- read.csv(sags_path)
+  
+  # Automatically detect gene column
+  sags_col <- colnames(sags_df)[grep("gene", colnames(sags_df), ignore.case = TRUE)][1]
+  
+  if (!is.na(sags_col)) {
+    sags_genes <- unique(sags_df[[sags_col]])
+    
+    # Normalize gene symbols
+    my_genes_clean   <- toupper(trimws(meta_final_df$Gene))
+    sags_genes_clean <- toupper(trimws(sags_genes))
+    
+    # Calculate overlap
+    overlap <- intersect(my_genes_clean, sags_genes_clean)
+    
+    message(paste("    - Meta-analysis Genes:", length(my_genes_clean)))
+    message(paste("    - SAGs List Genes:    ", length(sags_genes_clean)))
+    message(paste("    - Overlap Count:      ", length(overlap)))
+    
+    # Identify missing SAGs
+    missed_sags <- setdiff(sags_genes_clean, my_genes_clean)
+    if(length(missed_sags) > 0) {
+      message("    - Top 10 Missing SAGs (absent in intersection of 3 studies):")
+      print(head(missed_sags, 10))
+    }
+  } else {
+    warning("Validation Skipped: 'Gene' column not found in SAGs.csv")
+  }
+} else {
+  warning("Validation Skipped: SAGs.csv not found.")
+}
+
+message("\n>>> Script 04 Complete Successfully.")
