@@ -1,0 +1,235 @@
+# ==============================================================================
+# Project: Meta-analysis of Alzheimer's Disease (Entorhinal Cortex)
+# Step 1: Raw Data Loading, QC, and Azimuth Input Preparation
+# ==============================================================================
+
+# 1. Load Required Libraries
+library(Seurat)
+library(dplyr)
+library(stringr)
+library(hdf5r)
+library(Matrix)
+
+# 2. Set Global Directories
+base_dir <- "~/meta_analysis/raw_data/EC"
+results_dir <- "~/meta_analysis/results/EC/new_control_standard/2026_03/ctrl_Braak0/Azimuth_input"
+
+if(!dir.exists(results_dir)) {
+  dir.create(results_dir, recursive = TRUE)
+}
+
+# ==============================================================================
+# Part 1. Grubman et al. (GSE138852)
+# ==============================================================================
+setwd(file.path(base_dir, "GSE138852"))
+
+# 1-1. Load Metadata
+path_grubman_meta <- file.path(base_dir, "GSE138852/donors info - Supplementary Table 1.csv")
+meta_df <- read.csv(path_grubman_meta, stringsAsFactors = FALSE, skip = 1)
+meta_df$batch_id <- sapply(str_split(meta_df$Case., " donor "), `[`, 1)
+
+# Function to define condition based on Braak Stage
+define_condition_by_braak <- function(diagnosis, braak) {
+  if ((is.na(braak) || braak == "") && diagnosis == "Control") return("Control")
+  braak <- trimws(braak)
+  if (braak %in% c("0", "I", "II")) return("Control")
+  else if (braak %in% c("V", "VI")) return("AD")
+  else return("Exclude")
+}
+
+meta_df$condition <- mapply(define_condition_by_braak, meta_df$Diagnosis, meta_df$Braak)
+
+meta_batch <- meta_df %>%
+  group_by(batch_id) %>%
+  summarise(
+    condition = dplyr::first(condition),
+    braak_stage = {
+      stages <- unique(Braak[!is.na(Braak) & Braak != ""])
+      if (length(stages) == 0) "Unknown(Control)" else paste(sort(stages), collapse="/")
+    },
+    age = paste(Age, collapse="/"),
+    sex = paste(unique(Gender), collapse="/"),
+    .groups = 'drop'
+  )
+
+# 1-2. Load Raw Counts & Create Seurat Object
+gz_files <- list.files(pattern = "\\.csv\\.gz$")
+raw_counts <- read.csv(gz_files[1], header = TRUE, row.names = 1, check.names = FALSE)
+sparse_counts <- as(as.matrix(raw_counts), "dgCMatrix")
+
+clean_gene_names <- sub("\\..*", "", rownames(sparse_counts))
+if (any(duplicated(clean_gene_names))) {
+  sparse_counts <- as(rowsum(as.matrix(sparse_counts), group = clean_gene_names), "dgCMatrix")
+} else {
+  rownames(sparse_counts) <- clean_gene_names
+}
+
+seurat_obj <- CreateSeuratObject(counts = sparse_counts, project = "Grubman_EC", min.cells = 10, min.features = 200)
+rm(raw_counts, sparse_counts); gc()
+
+# 1-3. Quality Control (QC)
+seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = "^MT-")
+seurat_obj <- subset(seurat_obj, subset = nFeature_RNA > 200 & nFeature_RNA < 5000 & percent.mt < 10)
+
+# 1-4. Inject Metadata & Filter
+seurat_obj$sample_id <- sub("^[^_]+_", "", colnames(seurat_obj))
+mm <- match(seurat_obj$sample_id, meta_batch$batch_id)
+
+seurat_obj$study       <- "Grubman et al"
+seurat_obj$region      <- "EC"
+seurat_obj$condition   <- meta_batch$condition[mm]
+seurat_obj$braak_stage <- meta_batch$braak_stage[mm]
+seurat_obj$age         <- meta_batch$age[mm]
+seurat_obj$sex         <- meta_batch$sex[mm]
+
+# Subset Control and AD only
+seurat_obj <- subset(seurat_obj, subset = condition %in% c("Control", "AD"))
+
+# 1-5. Save Azimuth Input
+saveRDS(seurat_obj, file.path(results_dir, "grubman_azimuth_input.rds"))
+
+
+# ==============================================================================
+# Part 2. Leng et al. (GSE147528)
+# ==============================================================================
+data_dir_leng <- file.path(base_dir, "GSE147528")
+h5_files_leng <- list.files(path = data_dir_leng, pattern = "*.h5", full.names = TRUE)
+
+# 2-1. Create Metadata
+leng_metadata <- data.frame(
+  sample_id = paste0("GSM", 4432635:4432654),
+  braak_stage = c(0, 0, 0, 2, 2, 2, 2, 6, 6, 6,    # SFG
+                  0, 0, 0, 2, 2, 2, 2, 6, 6, 6),   # EC
+  age = c(60, 50, 71, 72, 87, 91, 77, 82, 72, 82,  # SFG
+          60, 50, 71, 72, 87, 91, 77, 82, 72, 82), # EC
+  sex = rep("Male", 20),
+  stringsAsFactors = FALSE
+)
+
+leng_metadata$region <- ifelse(as.numeric(sub("GSM", "", leng_metadata$sample_id)) <= 4432644, "SFG", "EC")
+leng_metadata$condition <- case_when(
+  leng_metadata$braak_stage %in% c(0, 1, 2) ~ "Control",
+  leng_metadata$braak_stage %in% c(5, 6) ~ "AD",
+  TRUE ~ "Exclude"
+)
+
+# 2-2. Load, QC, and Merge
+seurat_list_leng <- list()
+
+for (file in h5_files_leng) {
+  filename <- basename(file)
+  gsm_id <- str_split(filename, "_")[[1]][1]
+  curr_meta <- leng_metadata %>% filter(sample_id == gsm_id)
+  
+  if (nrow(curr_meta) == 0 || curr_meta$region != "EC" || curr_meta$condition == "Exclude") next
+  
+  seurat_obj_leng <- CreateSeuratObject(counts = Read10X_h5(file), project = "Leng", min.cells = 10, min.features = 200)
+  seurat_obj_leng[["percent.mt"]] <- PercentageFeatureSet(seurat_obj_leng, pattern = "^MT-")
+  seurat_obj_leng <- subset(seurat_obj_leng, subset = nFeature_RNA > 200 & nFeature_RNA < 5000 & percent.mt < 10)
+  
+  if(ncol(seurat_obj_leng) < 50) next
+  
+  seurat_obj_leng$study       <- "Leng et al"
+  seurat_obj_leng$sample_id   <- gsm_id
+  seurat_obj_leng$region      <- curr_meta$region
+  seurat_obj_leng$condition   <- curr_meta$condition
+  seurat_obj_leng$braak_stage <- curr_meta$braak_stage 
+  seurat_obj_leng$age         <- curr_meta$age
+  seurat_obj_leng$sex         <- curr_meta$sex
+  
+  seurat_list_leng[[gsm_id]] <- seurat_obj_leng
+}
+
+if (length(seurat_list_leng) > 1) {
+  merged_leng <- merge(x = seurat_list_leng[[1]], y = seurat_list_leng[-1], add.cell.ids = names(seurat_list_leng), project = "Leng_Combined")
+} else {
+  merged_leng <- seurat_list_leng[[1]]
+}
+
+merged_leng <- JoinLayers(merged_leng)
+
+# 2-3. Save Azimuth Input
+saveRDS(merged_leng, file.path(results_dir, "leng_azimuth_input.rds"))
+
+
+# ==============================================================================
+# Part 3. Serrano-Pozo et al. (GSE268599)
+# ==============================================================================
+dir_serrano <- file.path(base_dir, "GSE268599")
+path_series_matrix <- file.path(dir_serrano, "GSE268599_series_matrix.txt")
+path_qc_csv        <- file.path(dir_serrano, "characteristics of individual donors (braak stages info) - Quality Control Data.csv")
+path_supp_csv      <- file.path(dir_serrano, "characteristics of individual donors (braak stages info) - Supplementary Table 1.csv")
+
+# 3-1. Metadata Mapping
+lines <- readLines(path_series_matrix)
+geo_acc <- str_replace_all(unlist(str_split(lines[grep("!Sample_geo_accession", lines)], "\t"))[-1], '"', "")
+supp_files <- unlist(str_split(lines[grep("!Sample_supplementary_file_1", lines)], "\t"))[-1]
+mw_ids <- str_extract(supp_files, "(?:6289-)?MW-\\d+")
+
+map_gsm_mw <- data.frame(sample_id = geo_acc, MW_ID = mw_ids, stringsAsFactors = FALSE)
+map_gsm_mw$join_key <- str_extract(map_gsm_mw$MW_ID, "MW-\\d+")
+
+qc_data <- read.csv(path_qc_csv, stringsAsFactors = FALSE)
+qc_data$join_key <- str_extract(qc_data$SampleName, "MW-\\d+")
+map_mw_donor <- qc_data %>% dplyr::select(join_key, Donor.ID, region) %>% distinct()
+map_mw_donor$Donor.ID <- as.character(map_mw_donor$Donor.ID)
+
+donor_info <- read.csv(path_supp_csv, stringsAsFactors = FALSE)
+donor_clean <- donor_info %>% 
+  dplyr::select(Donor.ID, Braak, Age, Sex) %>% 
+  mutate(Donor.ID = as.character(Donor.ID), Braak = trimws(Braak))
+
+meta_step1 <- left_join(map_gsm_mw, map_mw_donor, by = "join_key")
+meta_combined <- left_join(meta_step1, donor_clean, by = "Donor.ID")
+
+meta_combined$condition <- case_when(
+  meta_combined$Braak %in% c("0", "I", "II") ~ "Control",
+  meta_combined$Braak %in% c("V", "VI") ~ "AD",
+  TRUE ~ "Exclude"
+)
+
+# 3-2. Load, QC, and Merge
+matrix_files <- list.files(dir_serrano, pattern = "_matrix.mtx.gz")
+sample_prefixes <- sub("_matrix.mtx.gz", "", matrix_files) 
+
+seurat_list_serrano <- list()
+
+for (full_filename in sample_prefixes) {
+  current_gsm <- str_split(full_filename, "_")[[1]][1]
+  curr_meta <- meta_combined %>% filter(sample_id == current_gsm)
+  
+  if (nrow(curr_meta) == 0 || is.na(curr_meta$region) || curr_meta$region != "EC" || curr_meta$condition == "Exclude" || is.na(curr_meta$condition)) next
+  
+  p_mtx <- file.path(dir_serrano, paste0(full_filename, "_matrix.mtx.gz"))
+  p_bar <- file.path(dir_serrano, paste0(full_filename, "_barcodes.tsv.gz"))
+  p_fea <- file.path(dir_serrano, paste0(full_filename, "_features.tsv.gz"))
+  
+  counts <- ReadMtx(mtx = p_mtx, cells = p_bar, features = p_fea, feature.column = 2)
+  seurat_obj_serrano <- CreateSeuratObject(counts = counts, project = "Serrano", min.cells = 10, min.features = 200)
+  
+  seurat_obj_serrano[["percent.mt"]] <- PercentageFeatureSet(seurat_obj_serrano, pattern = "^MT-")
+  seurat_obj_serrano <- subset(seurat_obj_serrano, subset = nFeature_RNA > 200 & nFeature_RNA < 5000 & percent.mt < 10)
+  
+  if (ncol(seurat_obj_serrano) < 50) next 
+  
+  seurat_obj_serrano$study        <- "Serrano-Pozo et al"
+  seurat_obj_serrano$sample_id    <- current_gsm
+  seurat_obj_serrano$region       <- curr_meta$region
+  seurat_obj_serrano$condition    <- curr_meta$condition
+  seurat_obj_serrano$braak_stage  <- curr_meta$Braak
+  seurat_obj_serrano$age          <- curr_meta$Age
+  seurat_obj_serrano$sex          <- curr_meta$Sex
+  
+  seurat_list_serrano[[current_gsm]] <- seurat_obj_serrano
+}
+
+if (length(seurat_list_serrano) > 1) {
+  merged_serrano <- merge(x = seurat_list_serrano[[1]], y = seurat_list_serrano[-1], add.cell.ids = names(seurat_list_serrano), project = "Serrano_Combined")
+} else {
+  merged_serrano <- seurat_list_serrano[[1]]
+}
+
+merged_serrano <- JoinLayers(merged_serrano)
+
+# 3-3. Save Azimuth Input
+saveRDS(merged_serrano, file.path(results_dir, "serrano_azimuth_input.rds"))
