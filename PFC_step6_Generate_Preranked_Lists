@@ -1,0 +1,87 @@
+################################################################################
+# Script: 06_PFC_Generate_Preranked_Lists.R
+# Description: Generates ranked gene lists (g:Profiler) from meta-DEG
+#              and SAG overlap results.
+################################################################################
+
+suppressPackageStartupMessages({ library(dplyr) })
+
+# ==============================================================================
+# 1. Setup
+# ==============================================================================
+
+input_meta_dir    <- "~/meta_analysis/results/PFC/2026.04/Meta_Analysis/"
+input_overlap_dir <- "~/meta_analysis/results/PFC/2026.04/Overlap_Results/"
+output_dir        <- "~/meta_analysis/results/PFC/2026.04/PreRanked/"
+
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+message(">>> Generating pre-ranked lists (v2: 4 studies, excl. GSE214979)...")
+
+# ==============================================================================
+# 2. All Genes (Meta-Analysis Universe)
+# ==============================================================================
+message("\n>>> [Part 1] All Genes (Universe)...")
+
+df_all <- read.csv(file.path(input_meta_dir, "PFC_metaDEGs_All_Results.csv"),
+                   stringsAsFactors = FALSE)
+
+df_all_ranked <- df_all %>%
+  mutate(abs_log2fc = abs(beta_meta)) %>%
+  arrange(desc(abs_log2fc)) %>%
+  dplyr::select(gene, abs_log2fc, beta_meta, p_meta, padj_meta, everything())
+
+write.csv(df_all_ranked,
+          file.path(output_dir, "PFC_metaDEGs_All_Results_log2FC_Ranked.csv"),
+          row.names = FALSE)
+writeLines(df_all_ranked$gene,
+           file.path(output_dir, "PFC_All_Genes_log2FC_Ranked.txt"))
+
+message(sprintf("    Saved: %d genes ranked", nrow(df_all_ranked)))
+
+# ==============================================================================
+# 3. Overlap Genes — Up / Down (for g:Profiler)
+# ==============================================================================
+message("\n>>> [Part 2] Overlap Genes (Up / Down)...")
+
+df_overlap <- read.csv(file.path(input_overlap_dir, "PFC_SAGs_Overlap_Detailed.csv"),
+                       stringsAsFactors = FALSE)
+
+df_overlap_up <- df_overlap %>%
+  filter(direction == "Up") %>%
+  arrange(desc(beta_meta)) %>%
+  dplyr::select(gene, direction, beta_meta, padj_meta, everything())
+
+df_overlap_down <- df_overlap %>%
+  filter(direction == "Down") %>%
+  arrange(beta_meta) %>%
+  dplyr::select(gene, direction, beta_meta, padj_meta, everything())
+
+write.csv(df_overlap_up,
+          file.path(output_dir, "PFC_MetaDEGs_SAGs_Overlap_UP_log2FC_Ranked.csv"),
+          row.names = FALSE)
+writeLines(df_overlap_up$gene,
+           file.path(output_dir, "PFC_MetaDEGs_SAGs_Overlap_UP_Genes.txt"))
+
+write.csv(df_overlap_down,
+          file.path(output_dir, "PFC_MetaDEGs_SAGs_Overlap_DOWN_log2FC_Ranked.csv"),
+          row.names = FALSE)
+writeLines(df_overlap_down$gene,
+           file.path(output_dir, "PFC_MetaDEGs_SAGs_Overlap_DOWN_Genes.txt"))
+
+message(sprintf("    Up: %d genes | Down: %d genes", nrow(df_overlap_up), nrow(df_overlap_down)))
+
+# ==============================================================================
+# 4. All Overlap Genes — Signed log2FC .rnk (for Heatmap)
+# ==============================================================================
+message("\n>>> [Part 3] GSEA .rnk file (all overlap, signed log2FC)...")
+
+df_overlap_signed <- df_overlap %>%
+  arrange(desc(beta_meta)) %>%
+  dplyr::select(gene, beta_meta)
+
+write.table(df_overlap_signed,
+            file.path(output_dir, "PFC_MetaDEGs_SAGs_Overlap_Signed_log2FC.rnk"),
+            sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+
+message(sprintf("    Saved: %d genes in .rnk", nrow(df_overlap_signed)))
+message("\n>>> Script 06 v2 complete.")
