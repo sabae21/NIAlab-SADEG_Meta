@@ -1,0 +1,111 @@
+# ==============================================================================
+# Project: Meta-analysis of Alzheimer's Disease (Entorhinal Cortex)
+# Script Name: 05_EC_Overlap_Analysis_SAGs.R
+# Description: Performs overlap analysis between Meta-DEGs and Senescence-
+#              Associated Genes (SAGs) using Hypergeometric Tests.
+# Input:       Meta-analysis results (.csv) and SAGs reference list (.csv).
+# Output:      Statistical summary (.csv) and detailed overlap list (.csv).
+# ==============================================================================
+
+# ==============================================================================
+# 1. Setup and Data Loading
+# ==============================================================================
+
+# Load libraries
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+})
+
+# Define directory paths (Aligned with EC Step 4 outputs)
+input_dir  <- "~/meta_analysis/results/EC/new_control_standard/2026_04/Meta_Analysis/"
+output_dir <- "~/meta_analysis/results/EC/new_control_standard/2026_04/Overlap_Results/NewSAGs"
+sags_path  <- "~/meta_analysis/NewSAGs_Unique.csv"
+
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+message(">>> Loading datasets for Overlap Analysis...")
+
+# 1.1. Load Senescence-Associated Genes (SAGs)
+if (!file.exists(sags_path)) stop("Error: SAGs.csv file not found.")
+
+sags_raw <- read.csv(sags_path, stringsAsFactors = FALSE)
+
+# Auto-detect gene column (case-insensitive search for 'gene' or 'symbol')
+sags_col <- colnames(sags_raw)[grep("gene|symbol", colnames(sags_raw), ignore.case = TRUE)][1]
+if (is.na(sags_col)) stop("Error: Could not identify gene column in SAGs.csv")
+
+sags_list <- unique(toupper(trimws(sags_raw[[sags_col]])))
+
+# 1.2. Load EC Meta-Analysis Results
+meta_degs_df <- read.csv(file.path(input_dir, "Meta_EC_ADastroDEGs_Final.csv"))
+meta_up_df   <- read.csv(file.path(input_dir, "Meta_EC_ADastroDEGs_Up.csv"))
+meta_down_df <- read.csv(file.path(input_dir, "Meta_EC_ADastroDEGs_Down.csv"))
+universe_df  <- read.csv(file.path(input_dir, "EC_metaDEGs_All_Results.csv"))
+
+# 1.3. Standardize Gene Identifiers
+meta_degs_genes <- toupper(trimws(meta_degs_df$Gene))
+meta_up_genes   <- toupper(trimws(meta_up_df$Gene))
+meta_down_genes <- toupper(trimws(meta_down_df$Gene))
+universe_genes  <- toupper(trimws(universe_df$Gene))
+
+# ==============================================================================
+# 2. Hypergeometric Enrichment Analysis
+# ==============================================================================
+message(">>> Performing Hypergeometric Tests...")
+
+# Define Statistical Parameters
+N <- length(universe_genes)
+sag_in_universe <- intersect(sags_list, universe_genes)
+M <- length(sag_in_universe)
+
+# Function to execute test and return results
+run_hypergeo_test <- function(deg_list, category_name) {
+  
+  n <- length(deg_list)
+  overlap_genes <- intersect(deg_list, sag_in_universe)
+  k <- length(overlap_genes)
+  
+  # Hypergeometric Test (phyper)
+  # P[X >= k] = P[X > k-1]
+  p_val <- phyper(k - 1, M, N - M, n, lower.tail = FALSE)
+  
+  message(sprintf("    [%-18s] DEGs(n): %-4d | Overlap(k): %-3d | P-value: %s", 
+                  category_name, n, k, format.pval(p_val, digits = 4)))
+  
+  return(list(p_val = p_val, overlap = overlap_genes))
+}
+
+# Execute Tests
+res_all  <- run_hypergeo_test(meta_degs_genes, "All Meta-DEGs")
+res_up   <- run_hypergeo_test(meta_up_genes,   "Upregulated DEGs")
+res_down <- run_hypergeo_test(meta_down_genes, "Downregulated DEGs")
+
+# ==============================================================================
+# 3. Export Results
+# ==============================================================================
+message(">>> Saving results to disk...")
+
+# 3.1. Save Detailed Overlap List
+overlap_final_df <- meta_degs_df %>%
+  dplyr::filter(toupper(trimws(Gene)) %in% res_all$overlap) %>%
+  dplyr::mutate(Direction = ifelse(beta_meta > 0, "Up", "Down")) %>%
+  dplyr::select(Gene, Direction, everything())
+
+out_file_detail <- file.path(output_dir, "EC_Meta_SAGs_Overlap_Detailed.csv")
+write.csv(overlap_final_df, out_file_detail, row.names = FALSE)
+
+# 3.2. Save Statistical Summary
+summary_df <- data.frame(
+  Category = c("All DEGs", "Upregulated", "Downregulated"),
+  Universe_N = N,
+  SAGs_in_Universe_M = M,
+  DEGs_n = c(length(meta_degs_genes), length(meta_up_genes), length(meta_down_genes)),
+  Overlap_k = c(length(res_all$overlap), length(res_up$overlap), length(res_down$overlap)),
+  P_Value = c(res_all$p_val, res_up$p_val, res_down$p_val)
+)
+
+out_file_summary <- file.path(output_dir, "EC_SAGs_Hypergeometric_Test_Summary.csv")
+write.csv(summary_df, out_file_summary, row.names = FALSE)
+
+message(">>> Script 05 Completed Successfully.")
