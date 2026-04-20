@@ -1,0 +1,138 @@
+# ==============================================================================
+# Project: Meta-analysis of Alzheimer's Disease (Entorhinal Cortex)
+# Step 3: Pseudo-bulk Differential Expression Analysis (limma-voom)
+# ==============================================================================
+
+# 1. Load Required Libraries
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(edgeR)
+  library(limma)
+  library(dplyr)
+  library(tibble)
+  library(stringr)
+})
+
+# 2. Set Directories
+input_dir  <- "~/meta_analysis/results/EC/new_control_standard/2026_04/"
+output_dir <- "~/meta_analysis/results/EC/new_control_standard/2026_04/DEA_Results/"
+save_dir   <- file.path(output_dir, "limma_objects")
+
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+if (!dir.exists(save_dir))   dir.create(save_dir, recursive = TRUE)
+
+# ==============================================================================
+# 3. Define limma-voom Pipeline Function
+# ==============================================================================
+run_limma_voom_pipeline <- function(obj, study_name) {
+  message(paste0("\n>>> Processing Study: [", study_name, "]"))
+  
+  # 3.1 Data Validation (Control vs AD)
+  targets <- c("AD", "Control")
+  if (!all(targets %in% unique(obj$condition))) {
+    stop(paste("Error:", study_name, "is missing required AD/Control conditions."))
+  }
+  obj_clean <- subset(obj, subset = condition %in% targets)
+  
+  # 3.2 Pseudo-bulk Aggregation
+  meta_raw <- obj_clean@meta.data %>% 
+    dplyr::select(sample_id, condition) %>% 
+    distinct()
+  
+  meta_raw$sample_id_clean <- gsub("_", "-", meta_raw$sample_id)
+  
+  meta_summary <- meta_raw %>%
+    dplyr::select(sample_id_clean, condition) %>%
+    distinct() %>%
+    remove_rownames() %>%
+    column_to_rownames("sample_id_clean")
+  
+  pb <- AggregateExpression(obj_clean, group.by = "sample_id", assays = "RNA", 
+                            slot = "counts", return.seurat = FALSE)
+  pb_counts <- pb$RNA
+  
+  common_samples <- intersect(colnames(pb_counts), rownames(meta_summary))
+  if(length(common_samples) == 0) stop(paste("Sample ID mismatch in", study_name))
+  
+  pb_counts <- pb_counts[, common_samples, drop = FALSE]
+  meta_summary <- meta_summary[common_samples, , drop = FALSE]
+  
+  # 3.3 Create DGEList and Apply Relaxed Pre-filtering
+  # Method: CPM > 0.5 in at least 2 samples (Prevents massive gene loss)
+  y <- DGEList(counts = pb_counts, samples = meta_summary)
+  
+  keep <- rowSums(cpm(y) > 0.5) >= 2
+  y <- y[keep, , keep.lib.sizes = FALSE]
+  
+  # TMM Normalization
+  y <- calcNormFactors(y, method = "TMM")
+  
+  # 3.4 Design Matrix Setup
+  group <- factor(y$samples$condition, levels = c("Control", "AD"))
+  design <- model.matrix(~0 + group)
+  colnames(design) <- levels(group)
+  
+  # 3.5 Voom Transformation & Linear Modeling
+  v <- voom(y, design, plot = FALSE)
+  fit <- lmFit(v, design)
+  
+  cont.matrix <- makeContrasts(AD_vs_Ctrl = AD - Control, levels = design)
+  fit2 <- contrasts.fit(fit, cont.matrix)
+  fit2 <- eBayes(fit2)
+  
+  # 3.6 Extract Results & Calculate True Standard Error (SE) for Meta-analysis
+  res <- topTable(fit2, coef = "AD_vs_Ctrl", number = Inf, sort.by = "none")
+  res$SE <- sqrt(fit2$s2.post) * fit2$stdev.unscaled[, "AD_vs_Ctrl"]
+  
+  # 3.7 Format Output
+  res$gene <- rownames(res)
+  res$study <- study_name
+  
+  res <- res %>% 
+    dplyr::select(gene, study, logFC, SE, P.Value, adj.P.Val) %>%
+    dplyr::rename(PValue = P.Value, FDR = adj.P.Val)
+  
+  return(list(res_df = res, fit_obj = fit2))
+}
+
+# ==============================================================================
+# 4. Main Execution Loop
+# ==============================================================================
+
+files_map <- c(
+  "EC_astro_grubman_final.rds" = "Grubman",
+  "EC_astro_leng_final.rds"    = "Leng",
+  "EC_astro_serrano_final.rds" = "Serrano"
+)
+
+message(">>> Starting Differential Expression Analysis Pipeline...")
+
+for (f_name in names(files_map)) {
+  study_name <- files_map[[f_name]]
+  file_path <- file.path(input_dir, f_name)
+  
+  if (file.exists(file_path)) {
+    # Load Data
+    seurat_obj <- readRDS(file_path)
+    
+    # Run Pipeline
+    pipeline_out <- run_limma_voom_pipeline(seurat_obj, study_name)
+    dea_res_df <- pipeline_out$res_df
+    fit_object <- pipeline_out$fit_obj
+    
+    # Save Results (CSV & RDS)
+    if (!is.null(dea_res_df)) {
+      csv_path <- file.path(output_dir, paste0("limmavoom_DEG_", study_name, ".csv"))
+      rds_path <- file.path(save_dir, paste0("limma_res_", tolower(study_name), ".rds"))
+      
+      write.csv(dea_res_df, file = csv_path, row.names = FALSE)
+      saveRDS(fit_object, file = rds_path)
+      
+      message(paste("    -> Saved:", basename(csv_path)))
+    }
+  } else {
+    warning(paste("File not found:", file_path))
+  }
+}
+
+message("\n>>> All DEA processes completed successfully.")
