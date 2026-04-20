@@ -1,0 +1,206 @@
+################################################################################
+# Script: 07_PFC_Visualization.R
+# Description: Publication figures for PFC meta-analysis.
+#              Version 2: 4 studies (excl. GSE214979 / Anderson).
+# Figures:
+#   1. Donut Charts   — SAG proportion within meta-DEGs
+#   2. Volcano Plot   — Global overview with top SAG labels
+#   3. Forest Plots   — Top 3 genes by absolute log2FC
+#   4. Consistency Heatmap — All overlap SAGs ordered by signed log2FC
+################################################################################
+
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(ggrepel)
+  library(dplyr)
+  library(metafor)
+  library(pheatmap)
+  library(tibble)
+})
+
+# ==============================================================================
+# 1. Setup
+# ==============================================================================
+
+input_dir_meta    <- "~/meta_analysis/results/PFC/2026.04/Meta_Analysis/"
+input_dir_prerank <- "~/meta_analysis/results/PFC/2026.04/PreRanked/"
+sags_path         <- "~/meta_analysis/NewSAGs_Unique.csv"
+output_dir        <- "~/meta_analysis/results/PFC/2026.04/Figures/"
+
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+# ==============================================================================
+# 2. Data Loading
+# ==============================================================================
+
+meta_res   <- read.csv(file.path(input_dir_meta, "PFC_metaDEGs_All_Results.csv"),   stringsAsFactors = FALSE)
+meta_input <- read.csv(file.path(input_dir_meta, "PFC_meta_input_4studies.csv"),    stringsAsFactors = FALSE)
+
+sags_raw  <- read.csv(sags_path, stringsAsFactors = FALSE)
+sags_col  <- colnames(sags_raw)[grep("gene|symbol", colnames(sags_raw), ignore.case = TRUE)][1]
+sags_list <- unique(toupper(trimws(sags_raw[[sags_col]])))
+
+sig_degs        <- meta_res %>% filter(padj_meta < 0.05)
+up_degs         <- sig_degs %>% filter(beta_meta > 0)
+down_degs       <- sig_degs %>% filter(beta_meta < 0)
+meta_degs_genes <- toupper(trimws(sig_degs$gene))
+meta_up_genes   <- toupper(trimws(up_degs$gene))
+meta_down_genes <- toupper(trimws(down_degs$gene))
+
+rnk_df <- read.table(
+  file.path(input_dir_prerank, "PFC_MetaDEGs_SAGs_Overlap_Signed_log2FC.rnk"),
+  header = FALSE, sep = "\t", stringsAsFactors = FALSE
+)
+colnames(rnk_df) <- c("gene", "signed_log2fc")
+
+all_ranked_genes   <- rnk_df %>% arrange(desc(signed_log2fc)) %>% pull(gene)
+top_20_genes       <- rnk_df %>% arrange(desc(abs(signed_log2fc))) %>% head(20) %>% pull(gene)
+top_5_up           <- rnk_df %>% filter(signed_log2fc > 0) %>% arrange(desc(signed_log2fc)) %>% head(5) %>% pull(gene)
+top_5_down         <- rnk_df %>% filter(signed_log2fc < 0) %>% arrange(signed_log2fc) %>% head(5) %>% pull(gene)
+target_label_genes <- c(top_5_up, top_5_down)
+
+# ==============================================================================
+# 3. Figure 1: Donut Charts
+# ==============================================================================
+
+generate_donut_chart <- function(deg_genes, sag_genes, title, color_sag, color_other) {
+  overlap_count <- length(intersect(deg_genes, sag_genes))
+  other_count   <- length(setdiff(deg_genes, sag_genes))
+  
+  df <- data.frame(
+    Category = factor(c("SADEGs", "Non-SADEGs"), levels = c("Non-SADEGs", "SADEGs")),
+    Count    = c(overlap_count, other_count)
+  ) %>%
+    mutate(
+      Fraction      = Count / sum(Count),
+      ymax          = cumsum(Fraction),
+      ymin          = c(0, head(ymax, n = -1)),
+      LabelPosition = (ymax + ymin) / 2,
+      Label         = sprintf("%d\n(%.1f%%)", Count, Fraction * 100)
+    )
+  
+  ggplot(df, aes(ymax = ymax, ymin = ymin, xmax = 4, xmin = 3, fill = Category)) +
+    geom_rect(color = "white", linewidth = 0.5) +
+    geom_text(aes(x = 3.5, y = LabelPosition, label = Label),
+              size = 5, color = "white", fontface = "bold") +
+    scale_fill_manual(values = c("SADEGs" = color_sag, "Non-SADEGs" = color_other)) +
+    coord_polar(theta = "y") +
+    xlim(c(2, 4)) +
+    theme_void() +
+    theme(
+      legend.position = "right",
+      legend.title    = element_blank(),
+      legend.text     = element_text(size = 12),
+      plot.title      = element_text(hjust = 0.5, face = "bold", size = 16)
+    ) +
+    ggtitle(title)
+}
+
+png(file.path(output_dir, "Figure1A_Donut_All_DEGs.png"),  width = 1800, height = 1500, res = 300)
+print(generate_donut_chart(meta_degs_genes, sags_list, "All Meta-DEGs",       "#EFC000FF", "#868686FF"))
+dev.off()
+
+png(file.path(output_dir, "Figure1B_Donut_Up_DEGs.png"),   width = 1800, height = 1500, res = 300)
+print(generate_donut_chart(meta_up_genes,   sags_list, "Upregulated DEGs",   "#CD534CFF", "#868686FF"))
+dev.off()
+
+png(file.path(output_dir, "Figure1C_Donut_Down_DEGs.png"), width = 1800, height = 1500, res = 300)
+print(generate_donut_chart(meta_down_genes, sags_list, "Downregulated DEGs", "#0073C2FF", "#868686FF"))
+dev.off()
+
+# ==============================================================================
+# 4. Figure 2: Volcano Plot
+# ==============================================================================
+
+volcano_data <- meta_res %>%
+  mutate(
+    p_safe         = ifelse(p_meta == 0, .Machine$double.xmin, p_meta),
+    diff_expressed = case_when(
+      padj_meta < 0.05 & beta_meta > 0 ~ "Up",
+      padj_meta < 0.05 & beta_meta < 0 ~ "Down",
+      TRUE ~ "NS"
+    )
+  )
+
+fdr_threshold <- max(volcano_data$p_safe[volcano_data$padj_meta < 0.05], na.rm = TRUE)
+y_cutoff      <- -log10(fdr_threshold)
+label_data    <- volcano_data %>% filter(gene %in% target_label_genes)
+
+p_volcano <- ggplot(volcano_data, aes(x = beta_meta, y = -log10(p_safe), color = diff_expressed)) +
+  geom_point(alpha = 0.5, size = 1.2) +
+  scale_color_manual(values = c("Down" = "blue", "NS" = "grey80", "Up" = "red")) +
+  geom_vline(xintercept = 0,        linetype = "dashed", color = "black") +
+  geom_hline(yintercept = y_cutoff, linetype = "dashed", color = "black") +
+  geom_text_repel(
+    data          = label_data,
+    aes(label     = gene),
+    color         = "black", size = 4.5, fontface = "bold.italic",
+    box.padding   = 1.2, point.padding = 0.5, min.segment.length = 0,
+    segment.size  = 0.6, segment.color = "black", max.overlaps = Inf, seed = 42
+  ) +
+  labs(x = "Integrated Log2 Fold Change", y = "-log10(P-value)") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "top", legend.title = element_blank()) +
+  ggtitle(NULL)
+
+ggsave(file.path(output_dir, "Figure2_Volcano_Plot.png"), p_volcano, width = 8, height = 7, dpi = 300)
+
+# ==============================================================================
+# 5. Figure 3: Forest Plots (Top 3 genes by |log2FC|)
+# ==============================================================================
+
+study_labels_v2 <- c("Lau et al.", "Sadick et al.", "Serrano-Pozo et al.", "Chia et al.")
+lfc_cols_v2     <- c("lfc_lau", "lfc_sadick", "lfc_serrano", "lfc_chia")
+se_cols_v2      <- c("se_lau",  "se_sadick",  "se_serrano",  "se_chia")
+
+draw_forest_plot <- function(gene_name, lfc_cols, se_cols, labels) {
+  g_data <- subset(meta_input, gene == gene_name)
+  if (nrow(g_data) == 0) { warning(paste("Gene not found:", gene_name)); return(NULL) }
+  
+  yi  <- unlist(g_data[, lfc_cols])
+  sei <- unlist(g_data[, se_cols])
+  res <- tryCatch(rma(yi = yi, sei = sei, method = "REML"), error = function(e) NULL)
+  if (is.null(res)) return(NULL)
+  
+  png(file.path(output_dir, paste0("Figure3_Forest_", gene_name, ".png")),
+      width = 2400, height = 1500, res = 300)
+  forest(res, slab = labels, header = "Study", xlab = "Log2 Fold Change",
+         col = "royalblue", border = "royalblue", cex = 0.9)
+  text(min(res$ci.lb, na.rm = TRUE), -1.5,
+       bquote(paste("Heterogeneity: ", I^2, " = ", .(round(res$I2, 1)), "%")),
+       pos = 4, cex = 0.8)
+  dev.off()
+}
+
+for (g in head(top_20_genes, 3))
+  draw_forest_plot(g, lfc_cols_v2, se_cols_v2, study_labels_v2)
+
+# ==============================================================================
+# 6. Figure 4: Consistency Heatmap
+# ==============================================================================
+
+mat_data <- meta_input %>%
+  filter(gene %in% all_ranked_genes) %>%
+  select(gene, all_of(lfc_cols_v2)) %>%
+  column_to_rownames("gene")
+
+colnames(mat_data) <- c("GSE157827\n(Lau)", "GSE167494\n(Sadick)",
+                        "GSE268599\n(Serrano)", "GSE303823\n(Chia)")
+mat_data <- mat_data[all_ranked_genes[all_ranked_genes %in% rownames(mat_data)], ]
+
+png(file.path(output_dir, "Figure4_Consistency_Heatmap.png"), width = 2000, height = 2800, res = 300)
+pheatmap(mat_data,
+         color           = colorRampPalette(c("blue", "white", "red"))(50),
+         breaks          = seq(-1, 1, length.out = 51),
+         cluster_rows    = FALSE,
+         cluster_cols    = FALSE,
+         display_numbers = FALSE,
+         fontsize_row    = 8,
+         fontsize_col    = 10,
+         angle_col       = 45,
+         legend_breaks   = c(-1, -0.5, 0, 0.5, 1),
+         legend_labels   = c("-1.0", "-0.5", "0.0", "0.5", "Log2FC\n1.0"),
+         main            = "")
+dev.off()
+
+message(">>> Script 08 v2 complete.")
