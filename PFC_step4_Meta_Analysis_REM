@@ -1,0 +1,166 @@
+################################################################################
+# Script: 04_PFC_Meta_Analysis_REM.R
+# Description: Random-Effects Model (REML) meta-analysis on pseudo-bulk DEA
+#              results from 4 PFC astrocyte datasets.
+#              Control selection: Diagnosis Control + Braak 0-II.
+# Input:  DEA_GSE######_<author>.csv (output of Script 03)
+# Output: Meta-analysis results (combined logFC, SE, FDR, I2)
+################################################################################
+
+# ==============================================================================
+# 1. Setup
+# ==============================================================================
+
+if (!requireNamespace("metafor", quietly = TRUE)) install.packages("metafor")
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(metafor)
+})
+
+input_dir  <- "~/meta_analysis/results/PFC/2026.04/DEA_Results/"
+output_dir <- "~/meta_analysis/results/PFC/2026.04/Meta_Analysis/"
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+# ==============================================================================
+# 2. Data Loading
+# ==============================================================================
+message(">>> Loading DEA results...")
+
+studies <- list(
+  list(label = "Lau",     file = "DEA_GSE157827_lau.csv"),
+  list(label = "Sadick",  file = "DEA_GSE167494_sadick.csv"),
+  list(label = "Serrano", file = "DEA_GSE268599_serrano.csv"),
+  list(label = "Chia",    file = "DEA_GSE303823_chia.csv")
+)
+
+deg_list <- list()
+
+for (s in studies) {
+  file_path <- file.path(input_dir, s$file)
+  tag       <- tolower(s$label)
+  
+  if (!file.exists(file_path)) {
+    warning(paste("Missing file:", s$file))
+    next
+  }
+  
+  df <- read.csv(file_path) %>%
+    dplyr::select(gene, logFC, SE, PValue, FDR) %>%
+    dplyr::rename(
+      !!paste0("lfc_",  tag) := logFC,
+      !!paste0("se_",   tag) := SE,
+      !!paste0("pval_", tag) := PValue,
+      !!paste0("padj_", tag) := FDR
+    )
+  
+  deg_list[[s$label]] <- df
+  message(sprintf("    Loaded: %s (%d genes)", s$label, nrow(df)))
+}
+
+if (length(deg_list) < length(studies))
+  warning(sprintf("Only %d of %d studies loaded.", length(deg_list), length(studies)))
+
+meta_input <- Reduce(function(x, y) merge(x, y, by = "gene"), deg_list)
+message(sprintf(">>> Common genes across all studies: %d", nrow(meta_input)))
+
+if (nrow(meta_input) < 100) stop("Too few common genes. Check gene identifiers.")
+
+write.csv(meta_input,
+          file.path(output_dir, "PFC_meta_input_4studies.csv"),
+          row.names = FALSE)
+
+# ==============================================================================
+# 3. Random-Effects Meta-Analysis (REML)
+# ==============================================================================
+message(">>> Running REML meta-analysis...")
+
+study_tags   <- sapply(studies, function(s) tolower(s$label))
+n_total      <- nrow(meta_input)
+meta_results <- vector("list", n_total)
+
+for (i in seq_len(n_total)) {
+  yi  <- unlist(meta_input[i, paste0("lfc_", study_tags)])
+  sei <- unlist(meta_input[i, paste0("se_",  study_tags)])
+  
+  res <- tryCatch(
+    rma(yi = yi, sei = sei, method = "REML"),
+    error = function(e) NULL
+  )
+  
+  if (!is.null(res)) {
+    meta_results[[i]] <- data.frame(
+      gene      = meta_input$gene[i],
+      beta_meta = as.numeric(res$beta),
+      se_meta   = res$se,
+      p_meta    = res$pval,
+      ci_lb     = res$ci.lb,
+      ci_ub     = res$ci.ub,
+      I2        = res$I2,
+      tau2      = res$tau2,
+      n_studies = res$k
+    )
+  }
+  
+  if (i %% 1000 == 0) message(sprintf("    Progress: %d / %d", i, n_total))
+}
+
+meta_final_df           <- do.call(rbind, meta_results)
+meta_final_df$padj_meta <- p.adjust(meta_final_df$p_meta, method = "fdr")
+meta_final_df           <- meta_final_df[order(meta_final_df$p_meta), ]
+
+write.csv(meta_final_df,
+          file.path(output_dir, "PFC_metaDEGs_All_Results.csv"),
+          row.names = FALSE)
+
+message(">>> Meta-analysis complete.")
+
+# ==============================================================================
+# 4. Filtering
+# ==============================================================================
+message(">>> Filtering significant DEGs (FDR < 0.05)...")
+
+meta_degs <- subset(meta_final_df, padj_meta < 0.05)
+meta_up   <- subset(meta_degs, beta_meta > 0)
+meta_down <- subset(meta_degs, beta_meta < 0)
+
+message(sprintf("    Significant DEGs: %d (Up: %d / Down: %d)",
+                nrow(meta_degs), nrow(meta_up), nrow(meta_down)))
+
+write.csv(meta_degs, file.path(output_dir, "PFC_metaDEGs_Significant.csv"),   row.names = FALSE)
+write.csv(meta_up,   file.path(output_dir, "PFC_metaDEGs_Upregulated.csv"),   row.names = FALSE)
+write.csv(meta_down, file.path(output_dir, "PFC_metaDEGs_Downregulated.csv"), row.names = FALSE)
+
+# ==============================================================================
+# 5. SAG Overlap Validation
+# ==============================================================================
+message(">>> Validating overlap with SAG reference list...")
+
+sags_path <- "~/meta_analysis/NewSAGs_Unique.csv"
+
+if (file.exists(sags_path)) {
+  sags_df  <- read.csv(sags_path)
+  sags_col <- colnames(sags_df)[grep("gene", colnames(sags_df), ignore.case = TRUE)][1]
+  
+  if (!is.na(sags_col)) {
+    my_genes   <- toupper(trimws(meta_final_df$gene))
+    sags_genes <- toupper(trimws(unique(sags_df[[sags_col]])))
+    overlap    <- intersect(my_genes, sags_genes)
+    
+    message(sprintf("    Meta-analysis genes : %d", length(my_genes)))
+    message(sprintf("    SAG list genes      : %d", length(sags_genes)))
+    message(sprintf("    Overlap             : %d", length(overlap)))
+    
+    missed <- setdiff(sags_genes, my_genes)
+    if (length(missed) > 0) {
+      message("    Top 10 SAGs absent from intersection:")
+      print(head(missed, 10))
+    }
+  } else {
+    warning("SAG validation skipped: 'gene' column not found in SAGs.csv.")
+  }
+} else {
+  warning("SAG validation skipped: SAGs.csv not found.")
+}
+
+message("\n>>> Script 04 complete.")
