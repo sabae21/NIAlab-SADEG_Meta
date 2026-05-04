@@ -420,7 +420,7 @@ if (!"ast" %in% cell_types) {
 }
 
 # ==============================================================================
-# 2. Per-dataset Azimuth annotation and astrocyte extraction
+# 2. Per-dataset Cell annotation and astrocyte extraction
 # ==============================================================================
 message("Running per-dataset Azimuth annotation and BRETIGEA filtering...")
 
